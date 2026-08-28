@@ -155,6 +155,15 @@ func (h *ContainerDeyplomentHandler) DeployNetwork(pid int, sname string, instan
 	}
 	env.deployedServicesLock.Unlock()
 	logger.DebugLogger().Printf("New deployedServices table: %v", env.deployedServices)
+
+	if env.ebpfManager != nil {
+		if err := env.ebpfManager.AttachEgress(vethIfce.Attrs().Index); err != nil {
+			logger.ErrorLogger().Println("ebpf: attaching tc_egress, falling back to ProxyTUN for this container:", err)
+		} else if err := env.ebpfManager.SetLocalInstance(ip, vethIfce.Attrs().Index, peerVeth.Attrs().Index); err != nil {
+			logger.ErrorLogger().Println("ebpf: setting local_instances:", err)
+		}
+	}
+
 	return ip, ipv6, nil
 }
 
@@ -172,6 +181,13 @@ func (env *Environment) DetachContainer(sname string, instance int) {
 		env.freeContainerAddress(s.ipv6)
 		_ = network.ManageContainerPorts(s.ip, s.portmapping, network.ClosePorts)
 		_ = network.ManageContainerPorts(s.ipv6, s.portmapping, network.ClosePorts)
+
+		if env.ebpfManager != nil {
+			_ = env.ebpfManager.DetachEgress(s.veth.Attrs().Index)
+			_ = env.ebpfManager.ClearLocalInstance(s.ip)
+			_ = env.ebpfManager.ClearInstanceIP(s.ip)
+		}
+
 		_ = netlink.LinkDel(s.veth)
 		// if no interest registered delete all remaining info about the service
 		if !mqtt.MqttIsInterestRegistered(sname) {

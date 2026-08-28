@@ -5,6 +5,9 @@ import (
 	"NetManager/model"
 	"NetManager/network"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"NetManager/server"
@@ -24,12 +27,14 @@ var (
 	}
 	cfgFile   string
 	localPort int
+	noEbpf    bool
 )
 
 const MONITORING_CYCLE = time.Second * 2
 
 func Execute() error {
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
+	rootCmd.Flags().BoolVar(&noEbpf, "no-ebpf", false, "Disable the eBPF fast path and force pure ProxyTUN, overriding EbpfEnabled in netcfg.json")
 	return rootCmd.Execute()
 }
 
@@ -44,6 +49,10 @@ func startNetManager() error {
 		log.Fatalf("Unable to load config file: %s", err)
 	}
 
+	if noEbpf {
+		model.NetConfig.EbpfEnabled = false
+	}
+
 	if model.NetConfig.Debug {
 		logger.SetDebugMode()
 	}
@@ -51,6 +60,18 @@ func startNetManager() error {
 	log.Print(model.NetConfig)
 
 	network.IptableFlushAll()
+
+	// Detach the eBPF fast path (if it ever attached) before the process
+	// exits, so a restart never finds stale TC filters left on interfaces
+	// that outlive this process.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		logger.InfoLogger().Println("Shutting down")
+		server.Shutdown()
+		os.Exit(0)
+	}()
 
 	log.Println("NetManager started, but waiting for NodeEngine registration 🟠")
 	server.HandleRequests(localPort)

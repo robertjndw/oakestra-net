@@ -1,6 +1,7 @@
 package server
 
 import (
+	"NetManager/ebpf"
 	"NetManager/env"
 	"NetManager/handlers"
 	"NetManager/logger"
@@ -151,6 +152,56 @@ func register(writer http.ResponseWriter, request *http.Request) {
 
 	Proxy.SetEnvironment(&Env)
 
+	if model.NetConfig.EbpfEnabled {
+		loadEbpfFastPath()
+	}
+
 	logger.InfoLogger().Printf("NetManager is now running 🟢")
 	writer.WriteHeader(http.StatusOK)
+}
+
+// loadEbpfFastPath probes the kernel, loads the TC programs from oakestra.c
+// and attaches tc_decap to the NIC. Any failure here is logged and left as
+// a no-op Env.ebpfManager (nil): every fast-path hook falls through to
+// TC_ACT_OK on anything it doesn't recognize, so pure ProxyTUN is always a
+// safe fallback - see the ebpf package doc comment.
+func loadEbpfFastPath() {
+	nicIfindex, err := Env.NicIfindex()
+	if err != nil {
+		logger.ErrorLogger().Println("ebpf: resolving NIC ifindex, staying on ProxyTUN:", err)
+		return
+	}
+
+	nodeIP := net.ParseIP(model.NetConfig.NodePublicAddress)
+	manager, err := ebpf.Load(nicIfindex, nodeIP, Proxy.TunnelPort)
+	if err != nil {
+		logger.ErrorLogger().Println("ebpf: load failed, staying on ProxyTUN:", err)
+		return
+	}
+
+	if err := manager.AttachDecap(); err != nil {
+		logger.ErrorLogger().Println("ebpf: attaching tc_decap, staying on ProxyTUN:", err)
+		_ = manager.Close()
+		return
+	}
+
+	// A VIP miss on the fast path re-runs the exact same table-query flow
+	// ProxyTunnel.outgoingProxy already uses on a proxycache miss; the
+	// result feeds back into the fast path via Environment.AddTableQueryEntry.
+	manager.OnVIPMiss = func(vip net.IP) {
+		Env.GetTableEntryByServiceIP(vip)
+	}
+
+	Env.SetEbpfManager(manager)
+}
+
+// Shutdown detaches the eBPF fast path, if it is active, so a restart does
+// not find stale TC filters still attached to interfaces that outlive this
+// process (veths do, the NIC always does).
+func Shutdown() {
+	if m := Env.EbpfManager(); m != nil {
+		if err := m.Close(); err != nil {
+			logger.ErrorLogger().Println("ebpf: closing fast path on shutdown:", err)
+		}
+	}
 }

@@ -2,6 +2,7 @@ package env
 
 import (
 	"NetManager/TableEntryCache"
+	"NetManager/ebpf"
 	"NetManager/events"
 	"NetManager/logger"
 	"NetManager/model"
@@ -63,6 +64,8 @@ type Environment struct {
 	clusterPort string
 	clusterAddr string
 	mtusize     int
+	//### eBPF fast path (optional accelerator, nil unless enabled - see the ebpf package)
+	ebpfManager *ebpf.Manager
 }
 
 type service struct {
@@ -534,7 +537,10 @@ func (env *Environment) AddTableQueryEntry(entry TableEntryCache.TableEntry) {
 	err := env.translationTable.Add(entry)
 	if err != nil {
 		logger.ErrorLogger().Println(err)
+		return
 	}
+	env.syncEbpfServiceBackends(entry)
+	env.setEbpfInstanceIPIfLocal(entry)
 }
 
 // RefreshServiceTable force a table query refresh for a service
@@ -550,14 +556,117 @@ func (env *Environment) RefreshServiceTable(jobname string) {
 }
 
 func (env *Environment) RemoveServiceEntries(jobname string) {
+	removed := env.translationTable.SearchByJobName(jobname)
 	err := env.translationTable.RemoveByJobName(jobname)
 	if err != nil {
 		logger.ErrorLogger().Printf("CRITICAL-ERROR: %v", err)
 	}
+	for _, entry := range removed {
+		env.syncEbpfServiceBackends(entry)
+		env.clearEbpfInstanceIP(entry)
+	}
 }
 
 func (env *Environment) RemoveNsIPEntries(nsip string) {
+	entry, found := env.translationTable.SearchByNsIP(net.IP(nsip))
 	_ = env.translationTable.RemoveByNsip(net.IP(nsip))
+	if found {
+		env.syncEbpfServiceBackends(entry)
+		env.clearEbpfInstanceIP(entry)
+	}
+}
+
+// SetEbpfManager wires the eBPF fast path into this environment. Called once
+// at startup when EbpfEnabled is true and the load succeeds (see
+// server.register); leaving it unset (nil) means every table mutation below
+// is a no-op and all traffic keeps taking the ProxyTUN path unchanged.
+func (env *Environment) SetEbpfManager(m *ebpf.Manager) {
+	env.ebpfManager = m
+}
+
+// EbpfManager returns the active fast-path manager, or nil if eBPF is
+// disabled or failed to load.
+func (env *Environment) EbpfManager() *ebpf.Manager {
+	return env.ebpfManager
+}
+
+// NicIfindex resolves the ifindex of the node's internet-facing interface,
+// needed to attach tc_decap and to populate the `cfg` map's nic_ifindex.
+func (env *Environment) NicIfindex() (int, error) {
+	link, err := netlink.LinkByName(env.config.ConnectedInternetInterface)
+	if err != nil {
+		return 0, err
+	}
+	return link.Attrs().Index, nil
+}
+
+// syncEbpfServiceBackends recomputes the eBPF service_backends entry for
+// every VIP entry carries, from the translation table's current state. Safe
+// to call after either an Add or a Remove - SearchByServiceIP always
+// reflects what remains, so a VIP with no backends left is deleted from the
+// map rather than synced empty.
+func (env *Environment) syncEbpfServiceBackends(entry TableEntryCache.TableEntry) {
+	if env.ebpfManager == nil {
+		return
+	}
+	localNodeIP := net.ParseIP(model.NetConfig.NodePublicAddress)
+
+	for _, sip := range entry.ServiceIP {
+		vip := sip.Address
+		if !ebpf.IsIPv4Supported(vip) {
+			continue // IPv6 VIP: not on the fast path until M3
+		}
+
+		table := env.translationTable.SearchByServiceIP(vip)
+		if len(table) == 0 {
+			if err := env.ebpfManager.RemoveServiceBackends(vip); err != nil {
+				logger.ErrorLogger().Println("ebpf:", err)
+			}
+			continue
+		}
+
+		backends := make([]ebpf.BackendSource, 0, len(table))
+		for _, e := range table {
+			backends = append(backends, ebpf.BackendSource{
+				Nsip:       e.Nsip,
+				NodeIP:     e.Nodeip,
+				NodePort:   e.Nodeport,
+				OnThisNode: e.Nodeip.Equal(localNodeIP),
+			})
+		}
+		if err := env.ebpfManager.SyncServiceBackends(vip, sip.IpType, backends); err != nil {
+			logger.ErrorLogger().Println("ebpf:", err)
+		}
+	}
+}
+
+// setEbpfInstanceIPIfLocal mirrors convertToInstanceIp (ProxyTunnel.go) into
+// the instance_ip map when entry describes a container deployed on this
+// node - tc_egress needs it to rewrite the packet's source address.
+func (env *Environment) setEbpfInstanceIPIfLocal(entry TableEntryCache.TableEntry) {
+	if env.ebpfManager == nil {
+		return
+	}
+	if !entry.Nodeip.Equal(net.ParseIP(model.NetConfig.NodePublicAddress)) {
+		return
+	}
+	for _, sip := range entry.ServiceIP {
+		if sip.IpType != TableEntryCache.InstanceNumber || !ebpf.IsIPv4Supported(sip.Address) {
+			continue
+		}
+		if err := env.ebpfManager.SetInstanceIP(entry.Nsip, sip.Address); err != nil {
+			logger.ErrorLogger().Println("ebpf:", err)
+		}
+	}
+}
+
+func (env *Environment) clearEbpfInstanceIP(entry TableEntryCache.TableEntry) {
+	if env.ebpfManager == nil {
+		return
+	}
+	if err := env.ebpfManager.ClearInstanceIP(entry.Nsip); err != nil {
+		logger.ErrorLogger().Println("ebpf:", err)
+	}
 }
 
 func (env *Environment) generateAddress() (net.IP, error) {
