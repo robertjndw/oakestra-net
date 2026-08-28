@@ -8,28 +8,19 @@ import (
 )
 
 // TunDevice abstracts the platform TUN device the proxy reads outgoing
-// packets from and writes ingoing ones to. ReadBatch/WriteBatch batch
+// packets from and writes ingoing ones to. ReadBatch/WriteBatch coalesce
 // several packets into one syscall where the kernel supports it
-// (BatchSize() > 1) - nothing above this interface may assume that support
-// exists, since it is 1 on Darwin and on any Linux kernel that hasn't
-// negotiated IFF_VNET_HDR.
+// (BatchSize() > 1 - it's 1 on Darwin and on Linux without IFF_VNET_HDR).
 //
-// Every implementation - the real one and every test fake - shares one
-// convention for where the packet sits within a buffer: index i of bufs
-// occupies bufs[i][tunHeaderOffset : tunHeaderOffset+sizes[i]] on both Read
-// and Write. See tunHeaderOffset for why that headroom exists at all; it
-// lets the real adapter hand the platform buffers straight through with no
-// copy, while keeping the interface itself free of a platform detail.
+// Every implementation agrees on buffer layout: bufs[i][tunHeaderOffset :
+// tunHeaderOffset+sizes[i]] holds the packet, on both Read and Write. See
+// tunHeaderOffset for why the headroom exists.
 type TunDevice interface {
-	// ReadBatch fills up to len(bufs) packets, reporting how many in the
-	// return value and their individual lengths in sizes. A short read is
-	// not an error - see ErrTooManySegments's handling in the real adapter,
-	// which can turn a single oversized read into n=0, nil.
+	// A short read is not an error - see ErrTooManySegments's handling
+	// below, which can turn an oversized read into n=0, nil.
 	ReadBatch(bufs [][]byte, sizes []int) (int, error)
-	// WriteBatch writes len(bufs) complete packets, coalescing them with
-	// GRO where the kernel supports it. It may mutate bufs in the process;
-	// the caller must not read them again afterwards assuming they are
-	// unchanged.
+	// WriteBatch may mutate bufs; the caller must not read them again
+	// afterwards assuming they're unchanged.
 	WriteBatch(bufs [][]byte) (int, error)
 	// BatchSize is the most packets one Read/WriteBatch call can carry.
 	BatchSize() int
@@ -67,11 +58,8 @@ func newWgTunDevice(dev tun.Device) *wgTunDevice {
 func (w *wgTunDevice) ReadBatch(bufs [][]byte, sizes []int) (int, error) {
 	n, err := w.dev.Read(bufs, sizes, tunHeaderOffset)
 	if err != nil && errors.Is(err, tun.ErrTooManySegments) {
-		// Documented on tun.ErrTooManySegments itself as non-fatal: the
-		// kernel handed over a GSO superpacket with more segments than this
-		// batch had buffers for. The segments beyond the batch are gone, but
-		// the fd is still good - report nothing read rather than tearing the
-		// read loop down.
+		// Non-fatal: a GSO superpacket had more segments than this batch had
+		// buffers for. The extra segments are lost but the fd is still good.
 		logger.ErrorLogger().Println("tun: dropped a GSO superpacket wider than the read batch:", err)
 		return 0, nil
 	}

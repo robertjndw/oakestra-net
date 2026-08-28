@@ -13,35 +13,27 @@ import (
 )
 
 // ServiceLookup is the result of resolving a Service IP on the packet path.
-// Entries is empty on a miss, in which case Resolving is either a channel that
-// closes when the in-flight background resolution finishes - so the caller can
-// hold the packet and retry instead of losing it - or nil when no resolution
-// is running and the packet should just be dropped.
-//
-// Generation is the translation table generation Entries was read under. A
-// cached route tagged with the same generation is still current, so the caller
-// can skip revalidating it against every replica.
+// Entries is empty on a miss; Resolving is then either a channel that closes
+// when the in-flight background resolution finishes (caller can hold the
+// packet and retry) or nil if no resolution is running (drop the packet).
+// Generation is the table generation Entries was read under - a cached route
+// tagged with the same generation is still current.
 type ServiceLookup struct {
 	Entries    []TableEntryCache.TableEntry
 	Generation uint64
 	Resolving  <-chan struct{}
 }
 
-// The packet-path lookups take netip.Addr rather than net.IP: the parser
-// produces netip.Addr straight off the wire, and converting back allocated on
-// every translated packet.
+// takes netip.Addr, not net.IP: the parser produces netip.Addr off the wire,
+// and converting back allocated on every packet
 type Resolver interface {
-	// GetTableEntryByServiceIP returns the entries for addr, starting
-	// background resolution on a miss. Resolution needs a blocking MQTT round
-	// trip and must never happen on the packet path - see resolveServiceIPOnce.
+	// starts background resolution on a miss instead of blocking - see resolveServiceIPOnce
 	GetTableEntryByServiceIP(addr netip.Addr) ServiceLookup
 	GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool)
 }
 
-// LocalDeployments answers whether a job is deployed on this node. It decouples
-// ServiceResolver's MQTT interest bookkeeping (which needs to know when a job
-// is no longer needed locally) from the host/namespace management that
-// actually tracks deployments.
+// LocalDeployments decouples the MQTT interest bookkeeping below from the
+// host/namespace management that actually tracks deployments.
 type LocalDeployments interface {
 	IsServiceDeployed(job string) bool
 }
@@ -52,19 +44,15 @@ type LocalDeployments interface {
 type ServiceResolver struct {
 	translationTable TableEntryCache.TableManager
 	deployments      LocalDeployments
-	// resolveLock guards pendingResolves and failedServiceIPs. Both maps are
-	// created lazily so the zero ServiceResolver stays usable.
+	// guards pendingResolves and failedServiceIPs, both lazily created
 	resolveLock      sync.Mutex
 	pendingResolves  map[netip.Addr]chan struct{} // ServiceIP -> closed when its in-flight resolution finishes
 	failedServiceIPs map[netip.Addr]time.Time     // ServiceIP -> when resolution last failed
-	// tableQuery performs the blocking table query. Nil selects the real MQTT
-	// round trip; tests substitute a stub for it.
+	// nil selects the real MQTT round trip; tests substitute a stub
 	tableQuery func(netip.Addr) ([]TableEntryCache.TableEntry, error)
 }
 
-// New builds a ServiceResolver backed by a fresh translation table. deployments
-// is consulted to decide when a job's MQTT interest can be dropped; a nil
-// deployments is fine for tests that never exercise that path.
+// New builds a ServiceResolver. deployments may be nil in tests that don't exercise MQTT interest bookkeeping.
 func New(deployments LocalDeployments) *ServiceResolver {
 	return &ServiceResolver{
 		translationTable: TableEntryCache.NewTableManager(),
@@ -72,10 +60,8 @@ func New(deployments LocalDeployments) *ServiceResolver {
 	}
 }
 
-// IsServiceDeployed forwards to the injected LocalDeployments, which is what
-// lets ServiceResolver satisfy the mqtt package's interest-registration
-// interface directly. A nil LocalDeployments (e.g. a resolver built without
-// one for tests) reports false rather than panicking.
+// IsServiceDeployed lets ServiceResolver satisfy mqtt's interest-registration
+// interface directly; reports false rather than panicking if deployments is nil.
 func (r *ServiceResolver) IsServiceDeployed(job string) bool {
 	if r.deployments == nil {
 		return false
@@ -89,49 +75,36 @@ func (r *ServiceResolver) GetTableEntriesOnNode() []TableEntryCache.TableEntry {
 	return r.translationTable.SearchByNodeIp(ip)
 }
 
-// negativeResolveCacheTTL bounds how often a repeatedly-missed ServiceIP is
-// retried once a resolution attempt has failed. Without it, a sustained
-// stream of packets to an unresolvable VIP would kick off a fresh background
-// query (and its up-to-5s MQTT round trip) every time the previous one's
-// in-flight marker clears.
+// rate-limits retries against a ServiceIP that just failed to resolve, so a
+// sustained stream of packets to an unresolvable VIP doesn't start a fresh
+// MQTT round trip on every packet
 const negativeResolveCacheTTL = 2 * time.Second
 
-// maxConcurrentResolves bounds how many table queries may be in flight at
-// once. Each one blocks up to 5s on an MQTT round trip, so without a cap a
-// host scanning the proxy subnetwork - trivially large in the IPv6 range -
-// would cost one goroutine and one broker request per distinct destination.
+// caps in-flight table queries; each blocks up to 5s on MQTT, so an unbounded
+// scan of the (large, especially in IPv6) proxy subnetwork would otherwise
+// spawn one goroutine and broker request per destination
 const maxConcurrentResolves = 32
 
-// maxFailedServiceIPs caps the negative cache so the same scan can't grow
-// it without bound.
+// caps the negative cache so a scan can't grow it without bound
 const maxFailedServiceIPs = 1024
 
-// GetTableEntryByServiceIP Given a ServiceIP this method performs a search in the local ServiceCache
-// If the entry is not present, resolution is kicked off in the background and this call returns
-// the channel that signals its completion - see resolveServiceIPOnce for why this must not block.
+// GetTableEntryByServiceIP searches the local table for addr. On a miss it
+// kicks off background resolution rather than blocking here - this runs on
+// the single outgoing-packet goroutine, and resolution needs an MQTT round
+// trip - and returns the channel that signals completion so the caller can
+// hold the packet and retry.
 func (r *ServiceResolver) GetTableEntryByServiceIP(addr netip.Addr) ServiceLookup {
-	// If entry already available
 	table, generation := r.translationTable.SearchByServiceIP(addr)
 	if len(table) > 0 {
-		// mark the job as just used, so its MQTT interest doesn't expire
-		table[0].Touch()
+		table[0].Touch() // keep the job's MQTT interest from expiring
 		return ServiceLookup{Entries: table, Generation: generation}
 	}
-
-	// Miss: resolving requires a blocking MQTT round trip (up to ~5s, see
-	// mqtt.Tablequery). This is called from the single outgoing-packet
-	// goroutine, so doing that inline here would stall every flow on the
-	// node, not just this one. Drop this packet and resolve in the
-	// background instead; the caller can hang onto it and retry once the
-	// returned channel closes, or let a TCP retransmit go through.
 	return ServiceLookup{Resolving: r.resolveServiceIPOnce(addr)}
 }
 
-// resolveServiceIPOnce starts background resolution for ip and returns a
-// channel that is closed once the attempt finishes, so a caller can hold onto
-// the packet that triggered it. Returns nil when no attempt is running: a
-// recent one already failed (see negativeResolveCacheTTL) or too many are
-// already in flight, in which case the caller should drop the packet.
+// resolveServiceIPOnce starts background resolution for key and returns a
+// channel closed once it finishes. Returns nil (caller should drop the
+// packet) if a recent attempt already failed or too many are in flight.
 func (r *ServiceResolver) resolveServiceIPOnce(key netip.Addr) <-chan struct{} {
 	r.resolveLock.Lock()
 
@@ -177,10 +150,8 @@ func (r *ServiceResolver) resolveServiceIPOnce(key netip.Addr) <-chan struct{} {
 	return done
 }
 
-// rememberFailureLocked records a failed resolution, first sweeping expired
-// entries and - if every entry is still fresh - dropping the map wholesale
-// rather than letting it grow. Worst case that costs a handful of ServiceIPs
-// one extra query each.
+// rememberFailureLocked records a failed resolution, sweeping expired entries
+// first and dropping the map wholesale if it's still full afterwards.
 func (r *ServiceResolver) rememberFailureLocked(key netip.Addr) {
 	if r.failedServiceIPs == nil {
 		r.failedServiceIPs = make(map[netip.Addr]time.Time)
@@ -201,13 +172,10 @@ func (r *ServiceResolver) rememberFailureLocked(key netip.Addr) {
 	r.failedServiceIPs[key] = time.Now()
 }
 
-// resolveServiceIP performs the actual (blocking) table query and populates
-// the translation table. Must only ever run off the packet path.
-//
-// Every path that leaves addr unresolved has to report an error, not just log
-// one: resolveServiceIPOnce reads the return value to decide whether to arm
-// the negative cache, so returning nil after a failed install would clear it
-// and let the very next packet start another MQTT round trip.
+// resolveServiceIP performs the blocking table query and populates the
+// translation table. Must only run off the packet path. Every failure to
+// resolve addr must be returned as an error, not just logged: the caller
+// uses it to decide whether to arm the negative cache.
 func (r *ServiceResolver) resolveServiceIP(addr netip.Addr) error {
 	entryList, err := r.queryTable(addr)
 	if err != nil {
@@ -217,14 +185,9 @@ func (r *ServiceResolver) resolveServiceIP(addr netip.Addr) error {
 		return fmt.Errorf("table query for %s returned no instances", addr)
 	}
 
-	// Everything below has to be checked before the table is touched.
-	// ReplaceJobEntries deliberately displaces whatever holds the namespace
-	// IPs the new entries claim, so installing a response and only then
-	// deciding to reject it would take a working route down with it.
-	//
-	// A table query answers for exactly one job (see responseParser), so the
-	// whole instance list can be installed as one atomic replacement instead
-	// of entry by entry - each of which would rebuild the table indexes.
+	// validate before touching the table: ReplaceJobEntries displaces
+	// whatever holds the claimed namespace IPs, so install-then-reject would
+	// take a working route down with it
 	jobName := entryList[0].JobName
 	for i := range entryList {
 		if entryList[i].JobName != jobName {
@@ -233,8 +196,7 @@ func (r *ServiceResolver) resolveServiceIP(addr netip.Addr) error {
 		}
 	}
 
-	// A response can be well-formed and still not answer the question that was
-	// asked: it resolves a job, not necessarily this address.
+	// a well-formed response can still resolve the wrong address for this job
 	if !resolvesServiceIP(entryList, addr) {
 		return fmt.Errorf("table query for %s resolved job %s but not that address", addr, jobName)
 	}
@@ -244,8 +206,7 @@ func (r *ServiceResolver) resolveServiceIP(addr netip.Addr) error {
 	}
 
 	mqtt.MqttRegisterInterest(jobName, r)
-	// register interest for sip as well to avoid querying the address too many times
-	mqtt.MqttRegisterInterest(addr.String(), r)
+	mqtt.MqttRegisterInterest(addr.String(), r) // avoid re-querying this address too
 	return nil
 }
 
@@ -285,8 +246,6 @@ func (r *ServiceResolver) RefreshServiceTable(jobname string) {
 	if err != nil {
 		return
 	}
-	// One replacement, one index rebuild - readers see either the whole old
-	// set or the whole new one, never a table mid-refresh.
 	if err := r.translationTable.ReplaceJobEntries(jobname, entryList); err != nil {
 		logger.ErrorLogger().Println(err)
 	}

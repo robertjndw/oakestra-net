@@ -50,8 +50,8 @@ type Sink interface {
 type Datapath struct {
 	environment resolver.Resolver
 	localIP     netip.Addr
-	// The proxy subnetworks are netip.Prefix rather than net.IPNet so the
-	// per-packet containment check needs no conversion of the parsed address.
+	// netip.Prefix, not net.IPNet, so the per-packet containment check needs
+	// no conversion of the parsed address.
 	ProxyIPv4Prefix netip.Prefix
 	ProxyIPv6Prefix netip.Prefix
 	proxycache      *ProxyCache
@@ -96,11 +96,9 @@ func (d *Datapath) Handle(dir Direction, buf []byte) Action {
 
 // handleOutgoing decides what to do with one packet read from the TUN device:
 // translate it (if it targets the semantic-routing subnetwork) and forward
-// it on. buf is only used for the duration of this call, unless it ends up
-// retained for replay (see retainForReplay). mayRetain must be false when
-// called from a replay goroutine itself - otherwise a resolution that
-// succeeds but still yields no matching table entry would re-enter and
-// replay forever.
+// it on. mayRetain must be false when called from a replay goroutine itself,
+// or a resolution that succeeds but still misses the table would re-enter
+// and replay forever.
 func (d *Datapath) handleOutgoing(buf []byte, mayRetain bool) Action {
 	pkt, ok := iputils.Parse(buf)
 	if !ok {
@@ -110,11 +108,9 @@ func (d *Datapath) handleOutgoing(buf []byte, mayRetain bool) Action {
 		logger.DebugLogger().Printf("Outgoing packet:\t\t\t%s ---> %s\n", pkt.SrcIP(), pkt.DstIP())
 	}
 
-	// A later fragment has no transport header to resolve a flow with, only
-	// the translation its first fragment already established. If that first
-	// fragment is itself still queued waiting for the route, this one has to
-	// wait behind it rather than be dropped - otherwise the datagram loses
-	// every fragment but the first and can never reassemble.
+	// A later fragment carries no transport header, so it can only reuse the
+	// translation its first fragment established - queue it behind that
+	// fragment if the route is still pending, rather than dropping it.
 	if isLaterFragment(&pkt) {
 		if action, ok := d.forwardLaterFragment(&pkt); ok {
 			return action
@@ -156,12 +152,8 @@ func (d *Datapath) handleOutgoing(buf []byte, mayRetain bool) Action {
 }
 
 // forwardResult turns a resolved destination into the Action the caller
-// should take: if the destination is this machine, the packet never has to
-// leave - hand it straight to the ingoing pipeline and return whatever that
-// decides, instead of round-tripping it over the network. dstHost is always
-// valid here - both callers (outgoingProxy's route resolution and its cached
-// path) only ever hand back an address that already passed
-// TableEntryCache.AddrFromIP's validity check.
+// should take. If dstHost is this machine, skip the network round trip and
+// feed the packet straight into the ingoing pipeline.
 func (d *Datapath) forwardResult(dstHost netip.Addr, dstPort int, packetBytes []byte) Action {
 	if dstHost == d.localIP {
 		if logger.IsDebug() {
@@ -178,12 +170,8 @@ func (d *Datapath) forwardResult(dstHost netip.Addr, dstPort int, packetBytes []
 }
 
 // forwardLaterFragment translates a non-first fragment using the state its
-// first fragment left behind and reports where to send it, to the same node
-// its first fragment went to. Only the addresses (and, for IPv4, the header
-// checksum) are rewritten - there is no transport header here to checksum,
-// and Rewrite already knows not to look for one. ok is false when there is no
-// such state, so the caller can decide whether the fragment is worth holding
-// onto.
+// first fragment left behind, sending it to the same node. ok is false when
+// there is no such state.
 func (d *Datapath) forwardLaterFragment(pkt *iputils.Packet) (action Action, ok bool) {
 	translation, ok := d.proxycache.frags.lookup(keyFor(pkt))
 	if !ok {
@@ -206,9 +194,7 @@ func isLaterFragment(pkt *iputils.Packet) bool {
 }
 
 // maxReplayPacketsPerVIP bounds how many packets may queue behind one
-// unresolved Service IP, and maxReplayBytes bounds the total across all of
-// them. The old scheme kept a 64KiB pooled buffer per retained packet, so a
-// full queue pinned 16MiB to hold packets of around the 1450-byte MTU.
+// unresolved Service IP; maxReplayBytes bounds the total across all of them.
 const (
 	maxReplayPacketsPerVIP = 32
 	maxReplayBytes         = 1 << 20
@@ -222,15 +208,11 @@ type pendingReplay struct {
 }
 
 // retainForReplay holds a copy of a packet whose ServiceIP is still being
-// resolved and re-runs it once resolution finishes. Resolution can't happen on
-// the packet path, so without this the first packet of every cold flow is
-// lost: harmless for TCP, which retransmits, but it silently drops a one-shot
-// UDP datagram whose only fault was arriving before its route.
-//
-// Packets queue per Service IP and replay in arrival order. Giving each
-// retained packet its own goroutine instead - all of them blocked on the same
-// resolution channel - hands the order they resume in to the scheduler, which
-// reorders datagrams an application submitted in sequence.
+// resolved and re-runs it once resolution finishes; without it a cold flow's
+// first packet is just dropped, which silently loses a one-shot UDP datagram
+// (TCP just retransmits). Packets queue per Service IP and replay in arrival
+// order - one goroutine per packet, all waiting on the same channel, would
+// leave replay order up to the scheduler instead.
 func (d *Datapath) retainForReplay(buf []byte, vip netip.Addr, resolving <-chan struct{}) {
 	d.replayLock.Lock()
 
@@ -255,23 +237,20 @@ func (d *Datapath) retainForReplay(buf []byte, vip netip.Addr, resolving <-chan 
 	go d.replayWhenResolved(vip, resolving)
 }
 
-// retainFragmentForReplay queues a later fragment behind the first fragment of
-// its own datagram, which is already waiting for this Service IP to resolve.
-// A later fragment is still addressed to the untranslated Service IP, so it
-// keys into the same queue, and replay is FIFO - the first fragment installs
-// the translation before these reach forwardLaterFragment again.
+// retainFragmentForReplay queues a later fragment behind its datagram's first
+// fragment, which is already waiting on this Service IP. A later fragment is
+// still addressed to the untranslated VIP, so it keys into the same queue,
+// and FIFO replay guarantees the first fragment installs the translation
+// before these reach forwardLaterFragment again.
 //
-// It only ever appends to a queue that already exists. A later fragment
-// carries no transport ports, so it cannot drive a resolution of its own, and
-// with nothing already waiting there is no first fragment for it to stay
-// consistent with - buffering it speculatively would mean holding
-// attacker-controllable bytes for a first fragment that may never come.
-//
-// That is not a gap in normal operation: outgoingLoop is the only reader of
-// the TUN device and processes packets one at a time, so the local kernel's
-// own fragments reach handleOutgoing in the order it emitted them. The one
-// interleaving that does occur is with a replay in progress, and
-// replayWhenResolved keeps its queue published for exactly that reason.
+// Only appends to a queue that already exists: a later fragment carries no
+// ports, so it can't start a resolution of its own, and with no first
+// fragment already waiting there's nothing for it to stay consistent with -
+// buffering it speculatively would just hold attacker-controllable bytes for
+// a first fragment that may never come. outgoingLoop reads the TUN one packet
+// at a time, so a datagram's own fragments always arrive in order; the only
+// interleaving is with a replay in flight, which is why replayWhenResolved
+// keeps the queue published until it drains.
 func (d *Datapath) retainFragmentForReplay(buf []byte, vip netip.Addr) {
 	d.replayLock.Lock()
 	defer d.replayLock.Unlock()
@@ -281,15 +260,12 @@ func (d *Datapath) retainFragmentForReplay(buf []byte, vip netip.Addr) {
 	}
 }
 
-// enqueueReplayLocked copies buf onto queue unless the per-Service-IP packet
-// cap or the global byte budget is already reached. buf belongs to
-// outgoingLoop's pool and is reused as soon as handleOutgoing returns, so it
-// must be copied before being held past that call; the copy is sized to the
-// packet, not to the pool's buffer.
-//
-// Drop-newest: a full queue means the application is already ahead of
-// resolution, and evicting the head would reorder what does get through.
-// Caller must hold replayLock.
+// enqueueReplayLocked copies buf onto queue unless the per-VIP packet cap or
+// the global byte budget is already reached. buf is outgoingLoop's pool
+// buffer and gets reused as soon as handleOutgoing returns, so it must be
+// copied here. Drops the newest packet when full, rather than evicting the
+// head, to avoid reordering what does get through. Caller must hold
+// replayLock.
 func (d *Datapath) enqueueReplayLocked(queue *pendingReplay, buf []byte) bool {
 	if len(queue.packets) >= maxReplayPacketsPerVIP {
 		return false
@@ -311,18 +287,11 @@ func (d *Datapath) enqueueReplayLocked(queue *pendingReplay, buf []byte) bool {
 func (d *Datapath) replayWhenResolved(vip netip.Addr, resolving <-chan struct{}) {
 	<-resolving
 
-	// Drain in rounds, leaving the queue published until it is actually
-	// empty. outgoingLoop keeps reading the TUN while this runs, so a later
-	// fragment of a datagram being replayed right now can still arrive; if the
-	// queue were detached up front it would find neither a queue to join nor
-	// the translation state its first fragment is about to install, and be
-	// dropped microseconds before it would have worked.
-	//
-	// This terminates: once resolution has finished, handleOutgoing only
-	// retains a packet while GetTableEntryByServiceIP reports a resolution
-	// still in flight. After success the route is in the table, and after
-	// failure the negative cache is armed before this channel closes - so
-	// nothing new joins the queue and the next round finds it empty.
+	// Drain in rounds rather than detaching the queue up front: outgoingLoop
+	// keeps reading the TUN while this runs, and a later fragment of a
+	// datagram being replayed right now needs the queue still there to join.
+	// Terminates because resolution has already finished by the time we get
+	// here, so nothing new can join once a round finds the queue empty.
 	for {
 		d.replayLock.Lock()
 		queue := d.replays[vip]
@@ -359,17 +328,12 @@ func (d *Datapath) handleIngoing(buf []byte) Action {
 	}
 
 	if isLaterFragment(&pkt) {
-		// Unlike the outgoing direction, an unknown fragment is still written
-		// to the TUN device: an ingoing packet with no reverse mapping is
-		// forwarded unchanged here, and a fragment is no different. That is
-		// the common case on this path - ingoingProxy only matches flows this
-		// node originated, so every inbound *request* is unmatched.
-		//
-		// Known limitation: if the two tunnel datagrams reorder and a later
-		// fragment arrives before a first fragment that does get
-		// reverse-translated, the two are written with different sources and
-		// the datagram will not reassemble. Holding unknown later fragments
-		// to cover that would penalise the far more common pass-through case.
+		// Unlike outgoing, an unknown fragment is still delivered to the TUN
+		// device unchanged - ingoingProxy only matches flows this node
+		// originated, so every inbound request fragment is unmatched by
+		// design. Known gap: if the tunnel reorders and a later fragment
+		// beats the first fragment that does get reverse-translated, the
+		// datagram won't reassemble.
 		if translation, known := d.proxycache.frags.lookup(keyFor(&pkt)); known {
 			pkt.Rewrite(translation.newSrc, translation.newDst)
 		}
@@ -384,9 +348,7 @@ func (d *Datapath) handleIngoing(buf []byte) Action {
 			fragKey = keyFor(&pkt)
 		}
 
-		// ingoingProxy returning false just means there's no reverse mapping
-		// for this flow - the packet is still forwarded to the TUN device
-		// unchanged.
+		// No reverse mapping just means the packet is forwarded unchanged.
 		if d.ingoingProxy(&pkt) && firstFragment {
 			d.proxycache.frags.remember(fragKey, fragmentTranslation{
 				newSrc: pkt.SrcIP(),
@@ -400,12 +362,10 @@ func (d *Datapath) handleIngoing(buf []byte) Action {
 
 // outgoingProxy rewrites pkt in place if its destination falls in the
 // semantic-routing subnetwork, resolving the target instance via the
-// translation table (d.environment) and the per-flow ProxyCache. ok is
-// false if the packet isn't part of the proxy subnetwork, or its ServiceIP
-// can't currently be resolved - either way it should be dropped. resolving is
-// non-nil only when the ServiceIP is still being resolved in the background
-// (a cold miss), so the caller can hold onto the packet and retry once it
-// closes instead of losing it outright.
+// translation table and the per-flow ProxyCache. ok is false if the packet
+// should be dropped. resolving is non-nil only on a cold miss still being
+// resolved in the background, letting the caller hold the packet for retry
+// instead of losing it.
 func (d *Datapath) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPort int, resolving <-chan struct{}, ok bool) {
 	dstIP := pkt.DstIP()
 	srcIP := pkt.SrcIP()
@@ -423,13 +383,11 @@ func (d *Datapath) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPo
 		return netip.Addr{}, 0, nil, false
 	}
 
-	// Check if the ServiceIP is known
 	lookup := d.environment.GetTableEntryByServiceIP(dstIP)
 	if len(lookup.Entries) < 1 {
 		return netip.Addr{}, 0, lookup.Resolving, false
 	}
 
-	// Find the instanceIP of the current service
 	instanceIP, ok := d.convertToInstanceIp(pkt.Version(), srcIP)
 	if !ok {
 		return netip.Addr{}, 0, nil, false
@@ -444,14 +402,11 @@ func (d *Datapath) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPo
 		DstPort:       dstport,
 	}
 
-	// Check proxy proxycache (if any active flow is there already)
 	route, usable := d.proxycache.Route(key, lookup)
 	if !usable {
-		// Choose between the table entry according to the ServiceIP algorithm
-		// TODO: so far this only uses RR, ServiceIP policies should be implemented here
-		// rand.IntN (math/rand/v2) is safe to call concurrently and seeded
-		// per-process, unlike a shared *rand.Rand - needed now that replay
-		// goroutines (see retainForReplay) can call in here too.
+		// TODO: only does round-robin so far; ServiceIP policies belong here.
+		// rand.IntN is safe for concurrent use unlike a shared *rand.Rand -
+		// needed since replay goroutines can call in here too.
 		tableEntry := lookup.Entries[rand.IntN(len(lookup.Entries))]
 
 		entryDstIPnet := tableEntry.Nsip
@@ -467,10 +422,9 @@ func (d *Datapath) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPo
 			return netip.Addr{}, 0, nil, false
 		}
 
-		// dstNode/dstNodePort are cached here too - an Nsip is only ever
-		// valid on the node that handed it out, so as long as this cache
-		// entry (and its dstip) is still valid there's no need to look
-		// Nodeip/Nodeport back up by Nsip on every packet.
+		// dstNode/dstNodePort are cached here too, since an Nsip is only ever
+		// valid on the node that issued it - no need to look it back up by
+		// Nsip on every packet.
 		route = Route{
 			SrcInstanceIP: instanceIP,
 			DstIP:         entryDstIP,
@@ -518,17 +472,16 @@ func (d *Datapath) convertToInstanceIp(version uint8, srcIP netip.Addr) (netip.A
 
 // ingoingProxy checks the ProxyCache for a reverse mapping (a flow this node
 // itself originated via outgoingProxy) and, if found, rewrites pkt in place
-// back to its original semantic addressing. Returns false (no-op) if there
-// is no such mapping - the packet is then forwarded unchanged.
+// back to its original semantic addressing. Returns false if there is no
+// such mapping.
 func (d *Datapath) ingoingProxy(pkt *iputils.Packet) bool {
-	// The reply is addressed to the namespace IP and port the flow left from,
-	// and sourced from the instance IP and port it was sent to.
+	// The reply arrives addressed to the local namespace IP/port the flow
+	// left from, sourced from the instance IP/port it was sent to.
 	r, exist := d.proxycache.Reverse(
 		pkt.Protocol(), pkt.DstIP(), int(pkt.DstPort()), pkt.SrcIP(), int(pkt.SrcPort()))
 	if !exist {
 		return false
 	}
 
-	// Reverse conversion
 	return pkt.Rewrite(r.DstServiceIP, r.SrcIP)
 }

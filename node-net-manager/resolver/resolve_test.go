@@ -30,11 +30,8 @@ func resolvableEntry(job, vip string) TableEntryCache.TableEntry {
 	}
 }
 
-// A table query that leaves the address unresolved must be reported as a
-// failure. resolveServiceIPOnce keys the negative cache off the return value,
-// so reporting success would clear it and let the next packet start another
-// blocking MQTT round trip - one per packet burst, for an address that is
-// never going to resolve.
+// an unresolved query must return an error, or the negative cache never arms
+// and every packet burst restarts a blocking MQTT round trip
 func TestUnresolvedQueryIsAFailure(t *testing.T) {
 	const vip = "10.30.9.9"
 	addr := netip.MustParseAddr(vip)
@@ -65,8 +62,6 @@ func TestUnresolvedQueryIsAFailure(t *testing.T) {
 				t.Fatal("resolveServiceIP reported success for an address it did not resolve")
 			}
 
-			// The failure has to reach the negative cache, or the address is
-			// re-queried on every packet.
 			<-r.resolveServiceIPOnce(addr)
 			r.resolveLock.Lock()
 			_, remembered := r.failedServiceIPs[addr]
@@ -75,8 +70,6 @@ func TestUnresolvedQueryIsAFailure(t *testing.T) {
 				t.Error("the failed resolution was not recorded in the negative cache")
 			}
 
-			// And a following packet must be turned away rather than starting
-			// a second query.
 			if again := r.resolveServiceIPOnce(addr); again != nil {
 				t.Error("a second resolution was started inside the negative-cache TTL")
 			}
@@ -84,8 +77,6 @@ func TestUnresolvedQueryIsAFailure(t *testing.T) {
 	}
 }
 
-// The negative cache is a rate limit, not a permanent block: once the TTL is
-// past, the address gets another chance.
 func TestNegativeCacheExpires(t *testing.T) {
 	addr := netip.MustParseAddr("10.30.9.9")
 	r := &ServiceResolver{
@@ -111,22 +102,16 @@ func TestNegativeCacheExpires(t *testing.T) {
 	<-done
 }
 
-// A response that does not answer the question must not leave any trace in the
-// table. ReplaceJobEntries deliberately displaces whatever holds the namespace
-// IPs a new entry claims, so installing first and validating afterwards lets a
-// rejected response destroy a perfectly good route on its way out.
+// a rejected response must not displace the existing route sharing its namespace IP
 func TestWrongAddressResponseLeavesTableUntouched(t *testing.T) {
 	const wantedVIP = "10.30.9.9"
 
-	// An existing, healthy route, sharing a namespace IP with what the bogus
-	// response will claim.
 	good := resolvableEntry("goodjob", "10.30.1.1")
 
 	r := &ServiceResolver{
 		translationTable: TableEntryCache.NewTableManager(),
 		tableQuery: func(netip.Addr) ([]TableEntryCache.TableEntry, error) {
-			// structurally valid, for a different job, and answering for a
-			// Service IP that is not the one we asked about
+			// valid response, but for a different job and a different Service IP than asked
 			return []TableEntryCache.TableEntry{resolvableEntry("otherjob", "10.30.2.2")}, nil
 		},
 	}
@@ -149,9 +134,6 @@ func TestWrongAddressResponseLeavesTableUntouched(t *testing.T) {
 	}
 }
 
-// Every entry in one response belongs to one job (responseParser stamps a
-// single JobName), so a response that mixes jobs is malformed and must be
-// rejected rather than half-installed under the first entry's name.
 func TestMixedJobResponseRejected(t *testing.T) {
 	r := &ServiceResolver{
 		translationTable: TableEntryCache.NewTableManager(),

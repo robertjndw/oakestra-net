@@ -133,11 +133,8 @@ func datagramPayload(t *testing.T, wire []byte) string {
 	return string(wire[28:])
 }
 
-// TestReplayPreservesOrder is the regression test for cold-start reordering.
-// Every packet queued behind one unresolved Service IP used to get its own
-// goroutine blocked on the same channel, so the order they resumed in - and
-// therefore the order the datagrams left the node in - was the scheduler's
-// choice, not the application's.
+// TestReplayPreservesOrder checks that packets queued behind one unresolved
+// Service IP replay in the order they arrived.
 func TestReplayPreservesOrder(t *testing.T) {
 	dp, sink, resolving := coldDatapath(t)
 	vip := mustAddr(serverVIP)
@@ -249,11 +246,9 @@ func TestReplayFailedResolutionReleasesQueue(t *testing.T) {
 	})
 }
 
-// TestReplayHoldsLaterFragmentsOfAColdDatagram: a fragmented datagram sent to
-// a Service IP that is not resolved yet used to lose every fragment but the
-// first. The first was retained for replay, while the rest reached
-// forwardLaterFragment, found no translation state and were dropped - so the
-// datagram could never reassemble no matter how the replay went.
+// TestReplayHoldsLaterFragmentsOfAColdDatagram checks that both fragments of
+// a datagram sent to an unresolved Service IP queue for replay, not just the
+// first.
 func TestReplayHoldsLaterFragmentsOfAColdDatagram(t *testing.T) {
 	dp, sink, resolving := coldDatapath(t)
 	vip := mustAddr(serverVIP)

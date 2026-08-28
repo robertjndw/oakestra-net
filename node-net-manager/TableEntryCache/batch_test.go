@@ -8,8 +8,7 @@ import (
 	"testing"
 )
 
-// jobNsIP spreads namespace IPs across octets so a job can have more than 254
-// instances without producing an unparseable address.
+// spreads across octets so instance counts above 254 still parse
 func jobNsIP(instance int) string {
 	return fmt.Sprintf("10.19.%d.%d", instance/250+1, instance%250+1)
 }
@@ -54,8 +53,7 @@ func TestReplaceJobEntriesSwapsTheWholeSet(t *testing.T) {
 		t.Fatalf("indexed %d entries; want 5", len(entries))
 	}
 
-	// A refresh that comes back with fewer instances must drop the ones that
-	// went away, not merge them.
+	// fewer instances on refresh must drop the extras, not merge them
 	if err := table.ReplaceJobEntries("job", jobEntries("job", 2, "10.0.0.9", 50104)); err != nil {
 		t.Fatal(err)
 	}
@@ -79,8 +77,6 @@ func TestReplaceJobEntriesRebuildsIndexesOnce(t *testing.T) {
 	}
 	_, after := table.SearchByServiceIP(netip.MustParseAddr("10.30.0.1"))
 
-	// Adding the same 50 entries one at a time would bump the generation 50
-	// times, because each Add rebuilds every index.
 	if after-before != 1 {
 		t.Errorf("replacing 50 entries rebuilt the indexes %d times; want 1", after-before)
 	}
@@ -108,9 +104,7 @@ func TestReplaceJobEntriesRejectsInvalidInputAtomically(t *testing.T) {
 	}
 }
 
-// TestReplaceJobEntriesDisplacesNamespaceIPs: a namespace IP indexes exactly
-// one entry, so an incoming entry claiming one has to displace whatever held
-// it, even if that belonged to a different job.
+// a namespace IP claimed by a new entry must displace whoever held it, even across jobs
 func TestReplaceJobEntriesDisplacesNamespaceIPs(t *testing.T) {
 	table := NewTableManager()
 	stale := jobEntry("oldjob", 0, "10.0.0.1", 50103)
@@ -118,7 +112,7 @@ func TestReplaceJobEntriesDisplacesNamespaceIPs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// jobEntry(…, 0, …) reuses the same namespace IP.
+	// instance 0 reuses the same namespace IP as `stale`
 	if err := table.ReplaceJobEntries("newjob", []TableEntry{jobEntry("newjob", 0, "10.0.0.2", 50103)}); err != nil {
 		t.Fatal(err)
 	}
@@ -155,9 +149,7 @@ func TestReplaceJobEntriesSharesActivity(t *testing.T) {
 	}
 }
 
-// TestGenerationTracksRouteChanges: the generation is what lets the packet
-// path skip revalidating a cached route, so it has to move whenever anything
-// about the routes could have.
+// the generation must move on any route change, or a cached route would never get revalidated
 func TestGenerationTracksRouteChanges(t *testing.T) {
 	table := NewTableManager()
 	if err := table.ReplaceJobEntries("job", jobEntries("job", 1, "10.0.0.1", 50103)); err != nil {
@@ -215,8 +207,7 @@ func TestTableConcurrentSearchAndReplace(t *testing.T) {
 					return
 				default:
 				}
-				// Readers must always see a complete set, never a table
-				// caught mid-replacement.
+				// must never observe a table mid-replacement
 				if entries, _ := table.SearchByServiceIP(netip.MustParseAddr("10.30.0.1")); len(entries) != 20 {
 					t.Errorf("read a partially replaced table: %d entries", len(entries))
 					return
@@ -251,9 +242,7 @@ func BenchmarkReplaceJobEntries(b *testing.B) {
 	}
 }
 
-// BenchmarkAddOneByOne is the shape the refresh path used to have: every Add
-// rebuilds every index, so the cost of installing a job's instance list grows
-// quadratically with the instance count.
+// every Add rebuilds every index, so this is O(n^2) in the instance count
 func BenchmarkAddOneByOne(b *testing.B) {
 	for _, n := range []int{100, 500} {
 		b.Run(fmt.Sprintf("entries=%d", n), func(b *testing.B) {
@@ -293,8 +282,7 @@ func BenchmarkRemoveByJobName(b *testing.B) {
 	}
 }
 
-// BenchmarkIsRouteStillValid is the scan a cached flow used to pay on every
-// single packet. It is now only reached when the table generation has moved.
+// only reached on a generation mismatch; steady state skips this scan entirely
 func BenchmarkIsRouteStillValid(b *testing.B) {
 	for _, replicas := range []int{1, 10, 100, 1000} {
 		b.Run(fmt.Sprintf("replicas=%d", replicas), func(b *testing.B) {

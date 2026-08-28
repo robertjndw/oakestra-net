@@ -19,16 +19,13 @@ type TunnelSocket interface {
 // udpTunnelSocket backs TunnelSocket with the process's single UDP listen
 // socket.
 //
-// net.ListenUDP("udp", ...) - the network this package has always used, see
-// createTun - binds a dual-stack AF_INET6 socket on both Linux and Darwin: a
-// bare port with no host resolves to the unspecified address, and "udp"
-// (rather than "udp4"/"udp6") leaves IPV6_V6ONLY off, so v4 peers arrive as
-// v4-mapped v6 addresses on the same socket. That is why this wraps the
-// listen connection in ipv6.NewPacketConn, not ipv4's - ipv4.NewPacketConn
-// would only ever see the v6-mapped peers, never the v4 ones directly, and
-// in practice fails to read from a v6 socket at all. See
-// TestUDPTunnelSocketDualStackReceive for the proof: it sends over both
-// IPv4 and IPv6 loopback and asserts both are received through this type.
+// net.ListenUDP("udp", ...) binds a dual-stack AF_INET6 socket on both Linux
+// and Darwin: a bare port with no host resolves to the unspecified address,
+// and "udp" (rather than "udp4"/"udp6") leaves IPV6_V6ONLY off, so v4 peers
+// arrive as v4-mapped v6 addresses on the same socket. Wrap it in
+// ipv6.NewPacketConn, not ipv4's - ipv4.NewPacketConn only sees the raw v6
+// addresses and fails to read the v4-mapped ones. See
+// TestUDPTunnelSocketDualStackReceive.
 type udpTunnelSocket struct {
 	conn *net.UDPConn
 	pc   *ipv6.PacketConn

@@ -85,9 +85,8 @@ func largePayload(n int) []byte {
 	return p
 }
 
-// TestOutgoingFragmentedDatagram is the behaviour that was broken: only the
-// first fragment of an oversized UDP datagram was ever forwarded, so the
-// datagram could never reassemble at the far end.
+// TestOutgoingFragmentedDatagram checks a later fragment replays the first
+// fragment's translation and reassembles correctly at the far end.
 func TestOutgoingFragmentedDatagram(t *testing.T) {
 	dp := getFakeDatapath()
 	wire := buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, largePayload(2000))
@@ -286,9 +285,8 @@ func TestUnknownLaterFragmentDropped(t *testing.T) {
 }
 
 // TestHandleOutgoingForwardsWholeDatagram drives the complete outgoing path
-// over a real socket: every fragment of an oversized UDP datagram has to reach
-// the same node, consistently translated. Before fragment state was kept, only
-// the first one was ever forwarded.
+// over a real socket: every fragment of an oversized UDP datagram must reach
+// the same node, consistently translated.
 func TestHandleOutgoingForwardsWholeDatagram(t *testing.T) {
 	tunnel, listener := loopbackTunnel(t)
 

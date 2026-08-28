@@ -10,23 +10,20 @@ import (
 	"time"
 )
 
-// ConversionEntry is one translated flow. A flow is identified by the full
-// 5-tuple in both directions: identifying it by destination port alone (which
-// this cache used to do) collides as soon as one local socket talks to two
-// different Service VIPs on the same port - the common UDP shape - and lets a
-// reply for one VIP be reverse-translated as though it belonged to the other.
+// ConversionEntry is one translated flow, identified by the full 5-tuple in
+// both directions: destination port alone collides as soon as one local
+// socket talks to two different Service VIPs on the same port (the common UDP
+// shape), reverse-translating a reply for one VIP as though it belonged to
+// the other.
 type ConversionEntry struct {
 	srcip         netip.Addr
 	dstip         netip.Addr
 	dstServiceIp  netip.Addr
 	srcInstanceIp netip.Addr
-	// dstInstanceIp is the address the far end's replies will arrive from. It
-	// is not dstip: the remote node's own outgoingProxy translates the reply,
-	// because our srcInstanceIp is inside its proxy subnetwork too, so the
-	// reply is sourced from the target's instance IP. Without it the reverse
-	// lookup cannot tell two flows apart that share a local port and a remote
-	// port. Zero when the table entry has no InstanceNumber ServiceIP, which
-	// the reverse lookup treats as "matches any remote".
+	// dstInstanceIp is the address replies actually arrive from (not dstip:
+	// the remote node's outgoingProxy sources them from its own instance IP).
+	// Zero means "matches any remote" - used when the entry has no
+	// InstanceNumber ServiceIP to predict a reply source from.
 	dstInstanceIp netip.Addr
 	srcport       int
 	dstport       int

@@ -11,10 +11,7 @@ import (
 	"sync"
 )
 
-// nameRegexp validates Appname/Appns/Servicename/Servicenamespace. Compiled
-// once at package init instead of on every call to isValid - isValid runs
-// once per table mutation, not per packet, but there is no reason to pay for
-// a regexp compile on every insert either.
+// compiled once instead of per isValid call
 var nameRegexp = regexp.MustCompile("^[a-zA-Z0-9]{1,30}$")
 
 type TableEntry struct {
@@ -30,15 +27,12 @@ type TableEntry struct {
 	Nsip             net.IP      `json:"nsip"`
 	Nsipv6           net.IP      `json:"nsipv6"`
 	ServiceIP        []ServiceIP `json:"serviceIP"`
-	// activity tracks when this job was last used by the packet path, so the
-	// MQTT interest timer knows when to let the subscription expire. It's a
-	// pointer shared by every TableEntry copy for the same JobName (assigned
-	// once in Add), so Touch is a single atomic store - no lock, no map
-	// lookup, safe to call per packet.
+	// shared per JobName (set once in Add), so the MQTT interest timer knows
+	// when the job was last used without a lock or map lookup per packet.
 	activity *events.Activity `json:"-"`
 }
 
-// Touch marks this entry's job as just used. Safe to call on every packet.
+// Touch records that this entry's job was just used on the packet path.
 func (e *TableEntry) Touch() {
 	if e.activity != nil {
 		e.activity.Touch()
@@ -61,21 +55,14 @@ type ServiceIP struct {
 
 type TableManager struct {
 	translationTable []TableEntry
-	// byServiceIP and byNsIP index translationTable by address so the packet
-	// path (SearchByServiceIP/SearchByNsIP) doesn't have to scan the whole
-	// table. They hold copies of TableEntry, never pointers into
-	// translationTable: removeByIndex swap-removes and Add can reallocate the
-	// backing array, either of which would leave a pointer into the old array
-	// dangling/stale. Rebuilt wholesale on every mutation - mutations happen
-	// on deployment/MQTT events, not per packet, so an O(n) rebuild here is
-	// the cheap side of the trade.
+	// address indexes for SearchByServiceIP/SearchByNsIP; hold copies, not
+	// pointers into translationTable, since that slice gets swap-removed and
+	// reallocated. Rebuilt wholesale on every mutation.
 	byServiceIP map[netip.Addr][]TableEntry
 	byNsIP      map[netip.Addr]TableEntry
-	// generation counts index rebuilds. A cached route that was chosen under
-	// the current generation is known to still be current, which lets the
-	// packet path skip rescanning every replica of a service on each hit.
-	// Guarded by rwlock like the indexes, so a reader always sees a
-	// generation consistent with the entries it read alongside it.
+	// bumped on every index rebuild; a cached route tagged with the current
+	// generation is known still-valid, so the packet path can skip
+	// rescanning replicas on a hit. Guarded by rwlock like the indexes.
 	generation uint64
 	rwlock     sync.RWMutex
 }
@@ -90,14 +77,10 @@ func NewTableManager() TableManager {
 	// TODO cleanup of old entry every X seconds
 }
 
-// AddrFromIP converts a net.IP into a netip.Addr suitable for use as a map
-// key. Unmap is mandatory: net.ParseIP("10.0.0.1") stores a 16-byte
-// IPv4-in-IPv6 form, and netip.AddrFromSlice on 16 bytes returns an
-// Is4In6 address - which compares unequal (different internal
-// representation) to the plain Is4 address that iputils builds directly
-// from the wire bytes of a real IPv4 packet, even though both print the
-// same. Unmap normalizes 4-in-6 down to Is4 and is a no-op for a genuine
-// IPv6 address, so it is safe to call unconditionally.
+// AddrFromIP converts a net.IP to a netip.Addr for use as a map key. Unmap is
+// required: net.ParseIP stores IPv4 as 16-byte IPv4-in-IPv6, which otherwise
+// compares unequal to the plain Is4 address iputils builds from wire bytes,
+// even though both print the same.
 func AddrFromIP(ip net.IP) (netip.Addr, bool) {
 	if ip == nil {
 		return netip.Addr{}, false
@@ -149,13 +132,9 @@ func (t *TableManager) Add(entry TableEntry) error {
 }
 
 // ReplaceJobEntries swaps every entry belonging to jobName for a new set in a
-// single locked mutation. Doing it entry by entry - which is what the refresh
-// and cold-resolution paths used to do - rebuilds the indexes once per entry,
-// so refreshing a job with n instances costs O(n^2) index inserts while
-// holding the lock the packet path reads under.
-//
-// Validation happens before the lock is taken, so an invalid input leaves the
-// table untouched rather than half-replaced.
+// single locked mutation, rebuilding the indexes once instead of once per
+// entry. Entries are validated before the lock is taken, so a bad input
+// leaves the table untouched rather than half-replaced.
 func (t *TableManager) ReplaceJobEntries(jobName string, entries []TableEntry) error {
 	prepared := make([]TableEntry, 0, len(entries))
 	for _, entry := range entries {
@@ -166,8 +145,7 @@ func (t *TableManager) ReplaceJobEntries(jobName string, entries []TableEntry) e
 		prepared = append(prepared, entry)
 	}
 
-	// Namespace IPs index a single entry each, so an incoming entry that
-	// reuses one has to displace whatever held it before.
+	// an incoming entry reusing a namespace IP displaces whoever held it
 	replacedNsIPs := make(map[netip.Addr]struct{}, 2*len(prepared))
 	for _, entry := range prepared {
 		if addr, ok := AddrFromIP(entry.Nsip); ok {
@@ -232,8 +210,8 @@ func (t *TableManager) RemoveByNsip(nsip net.IP) error {
 	return nil
 }
 
-// RemoveByJobName drops every entry for a job in a single pass, rebuilding the
-// indexes once at the end rather than once per removed entry.
+// RemoveByJobName drops every entry for a job in one pass, rebuilding the
+// indexes once at the end.
 func (t *TableManager) RemoveByJobName(jobname string) error {
 	t.rwlock.Lock()
 	defer t.rwlock.Unlock()
@@ -251,23 +229,18 @@ func (t *TableManager) RemoveByJobName(jobname string) error {
 	return nil
 }
 
-// removeByIndexLocked swap-removes one entry without rebuilding the indexes.
-// Callers are responsible for calling rebuildIndexesLocked once they are done
-// mutating.
+// removeByIndexLocked swap-removes one entry; caller must rebuildIndexesLocked afterwards.
 func (t *TableManager) removeByIndexLocked(index int) {
 	t.translationTable[index] = t.translationTable[len(t.translationTable)-1]
 	t.translationTable = t.translationTable[:len(t.translationTable)-1]
 }
 
-// SearchByServiceIP looks up entries by ServiceIP. O(1) index lookup - the
-// previous implementation scanned every entry's ServiceIP list on every
-// call, on the packet path, per packet. The returned slice is the index's
-// own bucket, not a copy: rebuildIndexesLocked always replaces byServiceIP
-// wholesale rather than mutating a published bucket in place, so it's safe
-// to hand out directly. It's capped at its current length so an append by
-// the caller can't spill into (and silently reuse) the map's own capacity.
-// It also returns the table generation the result was read under; see
-// TableManager.generation.
+// SearchByServiceIP looks up entries by ServiceIP via the index (O(1)
+// instead of scanning the table) and also returns the generation the result
+// was read under (see TableManager.generation). The returned slice is the
+// index's own bucket, capped at its length so a caller append can't spill
+// into the map's spare capacity - safe since rebuildIndexesLocked always
+// replaces byServiceIP wholesale rather than mutating a bucket in place.
 func (t *TableManager) SearchByServiceIP(addr netip.Addr) ([]TableEntry, uint64) {
 	t.rwlock.RLock()
 	defer t.rwlock.RUnlock()
@@ -275,8 +248,7 @@ func (t *TableManager) SearchByServiceIP(addr netip.Addr) ([]TableEntry, uint64)
 	return matches[:len(matches):len(matches)], t.generation
 }
 
-// SearchByNsIP looks up a single entry by namespace IP. O(1) index lookup -
-// see SearchByServiceIP.
+// SearchByNsIP looks up a single entry by namespace IP via the index.
 func (t *TableManager) SearchByNsIP(addr netip.Addr) (TableEntry, bool) {
 	t.rwlock.RLock()
 	defer t.rwlock.RUnlock()
@@ -363,12 +335,10 @@ func (t *TableManager) isValid(entry TableEntry) bool {
 	return true
 }
 
-// IsRouteStillValid checks whether the full cached route (namespace IP, node
-// IP and node port) still matches an entry in table. Checking nsip alone is
-// not enough: a route refresh can reassign an instance to a different node
-// while its Nsip/Nsipv6 stays the same, and a cache hit that only compares
-// nsip would then keep tunnelling to the stale node forever (cache hits
-// refresh lastUsed, so a stale-but-active flow never ages out on its own).
+// IsRouteStillValid checks the full route (nsip, node IP, node port) against
+// table, not just nsip: a refresh can reassign an instance to a different
+// node while its nsip stays the same, and an nsip-only check would keep a
+// cached flow tunnelling to the stale node indefinitely.
 func IsRouteStillValid(nsip netip.Addr, nodeip netip.Addr, nodeport int, table []TableEntry) bool {
 	for i := range table {
 		entry := &table[i]

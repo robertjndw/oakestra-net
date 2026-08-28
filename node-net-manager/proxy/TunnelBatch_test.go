@@ -13,11 +13,9 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// fakeTunDevice is a counting, in-memory TunDevice: it never touches a real
-// TUN device, so these tests run the same way on every OS this repo builds
-// for. It honours the same header-offset convention the real adapter does
-// (see tunHeaderOffset), so a test exercising it exercises exactly the
-// buffer arithmetic the ingoing loop performs against the real one.
+// fakeTunDevice is a counting, in-memory TunDevice that honours the real
+// adapter's header-offset convention (see tunHeaderOffset), so tests run
+// without a real TUN device.
 type fakeTunDevice struct {
 	mu        sync.Mutex
 	batchSize int
@@ -56,7 +54,7 @@ func (f *fakeTunDevice) Name() string   { return "faketun" }
 func (f *fakeTunDevice) Close() error   { return nil }
 
 // fakeTunnelSocket is a counting, in-memory TunnelSocket standing in for the
-// listen socket - see fakeTunDevice.
+// listen socket.
 type fakeTunnelSocket struct {
 	mu    sync.Mutex
 	queue [][]byte
@@ -79,9 +77,8 @@ func (f *fakeTunnelSocket) ReadBatch(bufs [][]byte, sizes []int) (int, error) {
 func (f *fakeTunnelSocket) WriteBatch(netip.AddrPort, [][]byte) (int, error) { return 0, nil }
 func (f *fakeTunnelSocket) Close() error                                     { return nil }
 
-// batchTestTunnel wires a real Datapath (so translation actually runs) to
-// the counting fakes above, standing in for the real TunDevice/TunnelSocket
-// the way loopbackTunnel stands in for a real connection.
+// batchTestTunnel wires a real Datapath to the counting fakes above, so
+// tests exercise real translation without a real TunDevice/TunnelSocket.
 func batchTestTunnel(sock *fakeTunnelSocket, tun *fakeTunDevice) *Tunnel {
 	tunnel := &Tunnel{
 		sock:             sock,
@@ -92,9 +89,9 @@ func batchTestTunnel(sock *fakeTunnelSocket, tun *fakeTunDevice) *Tunnel {
 	return tunnel
 }
 
-// TestIngoingBatchAmortisesSyscalls is the acceptance check for the whole
-// change: N packets delivered in one TunnelSocket.ReadBatch must reach the
-// TUN device through exactly one TunDevice.WriteBatch call, not N.
+// TestIngoingBatchAmortisesSyscalls checks that N packets delivered in one
+// TunnelSocket.ReadBatch reach the TUN device through exactly one
+// TunDevice.WriteBatch call.
 func TestIngoingBatchAmortisesSyscalls(t *testing.T) {
 	const n = 16
 	var queue [][]byte
@@ -124,10 +121,8 @@ func TestIngoingBatchAmortisesSyscalls(t *testing.T) {
 }
 
 // TestIngoingBatchCorrectAtBatchSizeOne covers the no-IFF_VNET_HDR fallback
-// (Darwin always, an older Linux kernel sometimes): with room for exactly
-// one packet per read, every packet still has to arrive at the TUN device,
-// just one WriteBatch call at a time rather than amortised - the loop must
-// not special-case this size away.
+// (Darwin always, an older Linux kernel sometimes): every packet must still
+// arrive at the TUN device, one WriteBatch call per read.
 func TestIngoingBatchCorrectAtBatchSizeOne(t *testing.T) {
 	packets := [][]byte{
 		buildUDPv4(t, serverInstIP, clientNsIP, 80, 41000, []byte("one")),
@@ -159,10 +154,9 @@ func TestIngoingBatchCorrectAtBatchSizeOne(t *testing.T) {
 	}
 }
 
-// TestHandleIngoingOnlyDeliversOrDrops locks in the assumption runIngoingBatch
-// relies on instead of silently trusting it: Handle(Ingoing, ...) never
-// returns ActionForward, for a matched flow, an unmatched one, and a
-// malformed packet alike.
+// TestHandleIngoingOnlyDeliversOrDrops checks that Handle(Ingoing, ...) never
+// returns ActionForward - runIngoingBatch relies on this - for a matched
+// flow, an unmatched one, and a malformed packet.
 func TestHandleIngoingOnlyDeliversOrDrops(t *testing.T) {
 	dp := getFakeDatapath()
 	dp.proxycache.Add(ConversionEntry{
@@ -195,9 +189,9 @@ func TestHandleIngoingOnlyDeliversOrDrops(t *testing.T) {
 	}
 }
 
-// fakeWgDevice is a minimal tun.Device fake used only to prove the real
-// adapter's handling of tun.ErrTooManySegments - it never opens a real TUN
-// device (which needs root), it just satisfies the interface.
+// fakeWgDevice is a minimal tun.Device fake for testing the real adapter's
+// handling of tun.ErrTooManySegments without opening a real TUN device
+// (which needs root).
 type fakeWgDevice struct {
 	calls int
 }
@@ -222,9 +216,8 @@ func (d *fakeWgDevice) Events() <-chan tun.Event                     { return ni
 func (d *fakeWgDevice) Close() error                                 { return nil }
 func (d *fakeWgDevice) BatchSize() int                               { return 4 }
 
-// TestWgTunDeviceErrTooManySegmentsIsNotFatal: a GSO superpacket wider than
-// the read batch must not stop the read loop built on top of ReadBatch - the
-// next call has to succeed normally.
+// TestWgTunDeviceErrTooManySegmentsIsNotFatal checks that a GSO superpacket
+// wider than the read batch doesn't stop later reads from succeeding.
 func TestWgTunDeviceErrTooManySegmentsIsNotFatal(t *testing.T) {
 	w := newWgTunDevice(&fakeWgDevice{})
 	bufs := [][]byte{make([]byte, tunHeaderOffset+64)}
@@ -241,12 +234,9 @@ func TestWgTunDeviceErrTooManySegmentsIsNotFatal(t *testing.T) {
 	}
 }
 
-// TestUDPTunnelSocketDualStackReceive proves ipv6.PacketConn, not ipv4's, is
-// the right wrapper for this package's listen socket: net.ListenUDP("udp",
-// ...) binds dual-stack, so a v4 peer's datagram arrives as a v4-mapped v6
-// address on the same socket ipv6.NewPacketConn wraps. Sending over both
-// IPv4 and IPv6 loopback and receiving both here is the proof - guessing
-// ipv4.NewPacketConn instead would fail this outright.
+// TestUDPTunnelSocketDualStackReceive checks that udpTunnelSocket's
+// ipv6.PacketConn wrapper receives both IPv4 and IPv6 loopback datagrams
+// over the same dual-stack listen socket.
 func TestUDPTunnelSocketDualStackReceive(t *testing.T) {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
 	if err != nil {

@@ -12,29 +12,20 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-// packetReadBufferSize is how much is read per packet off the TUN device or
-// UDP socket - generous headroom over any realistic MTU, but deliberately
-// NOT the same constant as socketBufferSize below: that one sizes the
-// kernel's socket buffer, and reusing it here would size every pooled
-// per-packet buffer at multiple megabytes for no benefit.
+// packetReadBufferSize is the size of Emit's pooled per-packet buffers.
+// Deliberately not shared with batchPacketCap below - that one is a fixed
+// per-loop allocation, and sizing it to this would waste megabytes per loop.
 const packetReadBufferSize = 64 * 1024
 
 // batchPacketCap is the per-packet payload capacity of both batched read
-// loops' buffers (see ingoingBatch/outgoingBatch). Unlike
-// packetReadBufferSize's sync.Pool, which grows and shrinks with demand,
-// these are fixed arrays of TunDevice.BatchSize() buffers held for the
-// process lifetime - so this size sets a hard memory floor: at Linux's
-// typical BatchSize() of 128, packetReadBufferSize's 64KiB would pin 8MiB per
-// loop for datagrams that cannot exceed the MTU by much. 9000 bytes covers
-// the jumbo-frame ceiling widely used by cloud VPCs (AWS, GCP) - comfortably
-// above any MTU this proxy is likely configured with - while keeping the
-// worst case (128 * (tunHeaderOffset+9000)) to about 1.1MiB per loop.
+// loops' buffers (ingoingBatch/outgoingBatch). These are fixed arrays of
+// TunDevice.BatchSize() buffers held for the process lifetime, so the size
+// sets a memory floor - 9000 bytes covers jumbo frames while keeping the
+// worst case (128 buffers * ~9KiB) to about 1.1MiB per loop.
 const batchPacketCap = 9000
 
 // socketBufferSize is the requested SO_RCVBUF/SO_SNDBUF size for the tunnel
-// UDP sockets. Larger than the previous 64KB so a burst of packets has room
-// to sit in the kernel queue instead of being dropped while this process is
-// busy translating the previous one.
+// UDP sockets, so a packet burst has room to queue instead of being dropped.
 const socketBufferSize = 4 * 1024 * 1024
 
 // Idle tunnel sockets are closed rather than kept for the process lifetime:
@@ -58,12 +49,9 @@ type Configuration struct {
 	ProxySubnetworkIPv6Prefix int    `json:"ProxySubnetworkIPv6Prefix"`
 }
 
-// batchWriter is the family-independent surface of *ipv4.PacketConn and
-// *ipv6.PacketConn a tunnelConn needs. ipv4.Message and ipv6.Message are both
-// aliases of the same underlying type (golang.org/x/net's internal
-// socket.Message), so one interface expressed in either package's Message
-// type is satisfied by both wrappers - there is no family-specific method set
-// to bridge here, just two constructors (see newTunnelConn).
+// batchWriter is the common surface of *ipv4.PacketConn and *ipv6.PacketConn.
+// ipv4.Message and ipv6.Message alias the same underlying type, so both
+// wrappers satisfy this with no bridging needed (see newTunnelConn).
 type batchWriter interface {
 	WriteBatch(ms []ipv4.Message, flags int) (int, error)
 }
@@ -86,14 +74,11 @@ type tunnelConn struct {
 // those belong to Datapath, which it drives via Handle/Emit.
 type Tunnel struct {
 	dp *Datapath
-	// sock is the tunnel's listen socket - only ever used for the batched
-	// ingoing read (see ingoingLoop). Sending to a peer still goes through
-	// connectionBuffer's per-peer dialled connections below (see
-	// sendOverTunnelBatch): unifying the two so a single sendmmsg could cover
-	// every destination at once is deliberately out of scope, not an
-	// oversight - it would source tunnel traffic from the listen port instead
-	// of an ephemeral one, which firewalls and NAT in real deployments treat
-	// very differently.
+	// sock is only used for the batched ingoing read (see ingoingLoop).
+	// Sending to a peer goes through connectionBuffer's per-peer dialled
+	// connections instead (see sendOverTunnelBatch), not this socket -
+	// otherwise outgoing traffic would be sourced from the listen port
+	// instead of an ephemeral one, which firewalls and NAT treat differently.
 	sock              TunnelSocket
 	connectionBuffer  map[netip.AddrPort]*tunnelConn
 	tun               TunDevice
@@ -112,17 +97,11 @@ type Tunnel struct {
 	isListening          bool
 }
 
-// packetBufPool holds MTU-sized buffers for Emit's ActionDeliver copies (the
-// replay goroutine's only path back to the TUN device), so it doesn't
-// allocate one per packet. Both batched read loops have their own
-// fixed-size pool instead - see ingoingBatch/outgoingBatch - since their
-// buffers need to stay put across a whole batch rather than being returned to
-// a shared pool after each packet. Buffers here are always pooled at full
-// capacity and resliced by the caller after a read.
-//
-// Every buffer here reserves tunHeaderOffset bytes up front - see TunDevice -
-// since these are also the buffers Emit's ActionDeliver case writes back to
-// the TUN device.
+// packetBufPool holds MTU-sized buffers for Emit's ActionDeliver copies, so
+// it doesn't allocate one per packet. The batched read loops don't use this
+// pool - their buffers stay put across a whole batch instead (see
+// ingoingBatch/outgoingBatch). Buffers reserve tunHeaderOffset bytes up
+// front, same as TunDevice's own buffers.
 var packetBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, tunHeaderOffset+packetReadBufferSize)
@@ -139,15 +118,12 @@ func putPacketBuf(b *[]byte) {
 	packetBufPool.Put(b)
 }
 
-// Emit performs the Action the Datapath decided on: dropping it, writing it
-// to the TUN device, or sending it over the tunnel to another node. Today its
-// only caller is the replay goroutine inside Datapath (see Sink) - both
-// synchronous read loops call Handle directly and batch the result
-// themselves instead (see runIngoingBatch, runOutgoingBatch) - so, unlike
-// those, it cannot assume action.Packet already sits in a buffer with the TUN
-// device's header room reserved (a replayed packet is a bare copy - see
-// Datapath.enqueueReplayLocked) and always copies onto a pooled buffer that
-// does before writing.
+// Emit performs the Action the Datapath decided on. Only the replay
+// goroutine calls this (see Sink) - the read loops call Handle directly and
+// batch the result themselves (runIngoingBatch, runOutgoingBatch). Unlike
+// those, action.Packet here is a bare copy with no header room reserved (see
+// Datapath.enqueueReplayLocked), so it's copied onto a pooled buffer that has
+// it before writing.
 func (t *Tunnel) Emit(action Action) {
 	switch action.Kind {
 	case ActionDrop:
@@ -219,9 +195,9 @@ func (t *Tunnel) tunIngoingListen() {
 	}
 }
 
-// outgoingBatchGroup collects the packets one outgoingBatch grouped for a
-// single remote destination, so sendOverTunnelBatch can resolve dst's
-// tunnelConn once and write the whole group instead of once per packet.
+// outgoingBatchGroup collects one outgoingBatch's packets bound for a single
+// remote destination, so sendOverTunnelBatch resolves dst's tunnelConn once
+// per group rather than once per packet.
 type outgoingBatchGroup struct {
 	dst  netip.AddrPort
 	gen  uint64
@@ -229,13 +205,11 @@ type outgoingBatchGroup struct {
 }
 
 // outgoingBatch holds the fixed set of buffers the outgoing loop reuses
-// across every read - mirroring ingoingBatch, see batchPacketCap - plus the
-// state that groups one read's ActionForward packets by destination. Unlike
-// the ingoing side, one read can be bound for several different peers, so
-// grouping is the whole point here: groupOf and groups only ever grow (never
-// get cleared or reallocated) as new destinations are seen, and gen
+// across every read (see batchPacketCap), plus the state that groups one
+// read's ActionForward packets by destination. groupOf and groups only grow,
+// never get cleared or reallocated, as new destinations are seen; gen
 // distinguishes "touched this batch" from "leftover from an older one"
-// without walking either structure between reads - see group.
+// without walking either structure between reads (see group).
 type outgoingBatch struct {
 	envelopes [][]byte
 	bufs      [][]byte
@@ -264,19 +238,16 @@ func newOutgoingBatch(size int) *outgoingBatch {
 	}
 	for i := range b.envelopes {
 		b.envelopes[i] = make([]byte, tunHeaderOffset+batchPacketCap)
-		// Unlike ingoingBatch.bufs (fed to TunnelSocket.ReadBatch, which has
-		// no header offset to apply), bufs here is fed straight to
-		// TunDevice.ReadBatch, whose contract is the full envelope - offset
-		// and all, see TunDevice - since the offset is applied inside it.
+		// TunDevice.ReadBatch wants the full envelope, offset included -
+		// unlike TunnelSocket.ReadBatch, which has no offset to apply.
 		b.bufs[i] = b.envelopes[i]
 	}
 	return b
 }
 
 // group appends packet to the batch's group for dst, creating or recycling a
-// group slot as needed, and records dst as touched this batch (see active).
-// packet aliases one of b.envelopes' buffers, so it stays valid only until
-// the next ReadBatch - callers must drain active before then.
+// group slot as needed. packet aliases one of b.envelopes' buffers, so it's
+// only valid until the next ReadBatch - callers must drain active before then.
 func (b *outgoingBatch) group(dst netip.AddrPort, packet []byte) {
 	idx, exists := b.groupOf[dst]
 	if exists && b.groups[idx].gen == b.gen {
@@ -296,12 +267,10 @@ func (b *outgoingBatch) group(dst netip.AddrPort, packet []byte) {
 }
 
 // writeMessages resizes b.msgs to len(bufs) and points each message's single
-// buffer at the corresponding packet. Addr is left nil throughout - every
-// destination here is a connected tunnelConn (see newTunnelConn), so
-// WriteBatch always sends to the peer the socket is already dialled to. Both
-// the outer slice and each message's inner Buffers slice are reused across
-// every call: sendOverTunnelBatch only ever runs on the single outgoing-loop
-// goroutine, so nothing here needs to be safe for concurrent use.
+// buffer at the corresponding packet. Addr is left nil - every destination
+// here is a connected tunnelConn, so WriteBatch always sends to the peer
+// it's dialled to. The slices are reused across calls; safe since
+// sendOverTunnelBatch only ever runs on the outgoing-loop goroutine.
 func (b *outgoingBatch) writeMessages(bufs [][]byte) []ipv4.Message {
 	for len(b.msgs) < len(bufs) {
 		b.msgs = append(b.msgs, ipv4.Message{Buffers: make([][]byte, 1)})
@@ -316,13 +285,10 @@ func (b *outgoingBatch) writeMessages(bufs [][]byte) []ipv4.Message {
 }
 
 // runOutgoingBatch performs one read-decide-send cycle: one TunDevice read,
-// Datapath.Handle for everything it returned, and - the whole point of
-// batching - at most one TunDevice.WriteBatch for whatever needed local
-// delivery plus one tunnel write per distinct remote destination, instead of
-// one write per packet either way. It returns the read error, if any; a
-// send/write error is only logged here, matching Emit's existing behaviour
-// for the same case (sendOverTunnelBatch itself still redials and retries a
-// failed send - see there).
+// Datapath.Handle for everything it returned, at most one TunDevice.WriteBatch
+// for local delivery, and one tunnel write per distinct remote destination. A
+// send/write error is only logged here; sendOverTunnelBatch handles its own
+// redial and retry.
 func (t *Tunnel) runOutgoingBatch(b *outgoingBatch) error {
 	n, err := t.tun.ReadBatch(b.bufs, b.sizes)
 	if err != nil {
@@ -338,18 +304,12 @@ func (t *Tunnel) runOutgoingBatch(b *outgoingBatch) error {
 		switch action := t.dp.Handle(Outgoing, packet); action.Kind {
 		case ActionDrop:
 		case ActionDeliver:
-			// action.Packet aliases packet (see Handle's contract), and packet
-			// already sits in a buffer with the TUN device's header room
-			// reserved before it - unlike Emit's ActionDeliver case, which
-			// copies for exactly that reason, this can go straight back with
-			// no copy.
+			// packet already sits in the envelope's header room, so this can
+			// go straight back with no copy (unlike Emit's ActionDeliver case).
 			b.deliverable = append(b.deliverable, b.envelopes[i][:tunHeaderOffset+b.sizes[i]])
 		case ActionForward:
 			b.group(action.Dst, action.Packet)
 		default:
-			// Handle(Outgoing, ...) only ever returns Deliver, Forward or
-			// Drop - never trust that silently, since acting on anything else
-			// here would mean grouping garbage into a send.
 			logger.ErrorLogger().Println("outgoing datapath returned an unexpected action:", action.Kind)
 		}
 	}
@@ -360,10 +320,8 @@ func (t *Tunnel) runOutgoingBatch(b *outgoingBatch) error {
 		}
 	}
 
-	// Groups are drained after both the read and the delivery write are done
-	// with the batch's buffers - sendOverTunnelBatch may block briefly on
-	// redial, and holding TUN writes on that would only slow this loop down,
-	// not the groups it hasn't gotten to yet.
+	// Drained after the delivery write: sendOverTunnelBatch can block briefly
+	// on redial, and there's no reason to hold the TUN write on that.
 	for _, idx := range b.active {
 		g := &b.groups[idx]
 		t.sendOverTunnelBatch(g.dst, g.bufs, b, 0)
@@ -371,10 +329,8 @@ func (t *Tunnel) runOutgoingBatch(b *outgoingBatch) error {
 	return nil
 }
 
-// outgoingLoop reads batches of packets off the TUN device and, per read,
-// forwards them with as few writes as the batch's shape allows: one
-// TunDevice.WriteBatch for everything needing local delivery, and one tunnel
-// write per distinct remote destination - see runOutgoingBatch.
+// outgoingLoop reads batches of packets off the TUN device and forwards them
+// via runOutgoingBatch.
 func (t *Tunnel) outgoingLoop(errchannel chan<- error) {
 	batch := newOutgoingBatch(t.tun.BatchSize())
 	for {
@@ -385,10 +341,9 @@ func (t *Tunnel) outgoingLoop(errchannel chan<- error) {
 }
 
 // ingoingBatch holds the fixed set of buffers the ingoing loop reuses across
-// every read - see batchPacketCap for why it isn't sized like
-// packetReadBufferSize's pool. envelopes are the full buffers (headroom included);
-// bufs are the same buffers pre-sliced past the headroom, which is all
-// TunnelSocket ever needs to see.
+// every read (see batchPacketCap). envelopes are the full buffers, headroom
+// included; bufs are the same buffers pre-sliced past the headroom, which is
+// all TunnelSocket needs to see.
 type ingoingBatch struct {
 	envelopes   [][]byte
 	bufs        [][]byte
@@ -414,11 +369,9 @@ func newIngoingBatch(size int) *ingoingBatch {
 }
 
 // runIngoingBatch performs one read-decide-write cycle: one TunnelSocket
-// read, Datapath.Handle for everything it returned, and - the whole point of
-// batching - at most one TunDevice write for everything that needed
-// delivering, instead of one write per packet. It returns the read error, if
-// any; a write error is only logged, matching Emit's existing behaviour for
-// the same case.
+// read, Datapath.Handle for everything it returned, and at most one
+// TunDevice write for everything that needed delivering. A write error is
+// only logged.
 func (t *Tunnel) runIngoingBatch(b *ingoingBatch) error {
 	n, err := t.sock.ReadBatch(b.bufs, b.sizes)
 	if err != nil {
@@ -433,10 +386,6 @@ func (t *Tunnel) runIngoingBatch(b *ingoingBatch) error {
 		case ActionDeliver:
 			b.deliverable = append(b.deliverable, b.envelopes[i][:tunHeaderOffset+b.sizes[i]])
 		default:
-			// Handle(Ingoing, ...) only ever returns Deliver or Drop - never
-			// trust that silently, since acting on a Forward here would mean
-			// writing a still-addressed-for-the-network packet to the TUN
-			// device instead of sending it.
 			logger.ErrorLogger().Println("ingoing datapath returned an unexpected action:", action.Kind)
 		}
 	}
@@ -474,11 +423,9 @@ func (t *Tunnel) connFor(dst netip.AddrPort) (*tunnelConn, error) {
 	return t.dialAndStore(dst)
 }
 
-// evictDeadConn removes con from connectionBuffer if it is still the entry
-// for dst, so dialAndStore's double-check doesn't just hand a failed
-// connection straight back. Guarded on identity, as in evictIdleConnections:
-// another goroutine may have already replaced it with a live connection by
-// the time a failed write gets here.
+// evictDeadConn removes con from connectionBuffer, but only if it's still the
+// entry for dst - another goroutine may already have replaced it with a live
+// connection by the time a failed write gets here.
 func (t *Tunnel) evictDeadConn(dst netip.AddrPort, con *tunnelConn) {
 	t.connectionBufferLock.Lock()
 	if t.connectionBuffer[dst] == con {
@@ -487,33 +434,23 @@ func (t *Tunnel) evictDeadConn(dst netip.AddrPort, con *tunnelConn) {
 	t.connectionBufferLock.Unlock()
 }
 
-// sendOverTunnel sends packetBytes to dst over the tunnel. The local-delivery
-// shortcut and the invalid-host check happen in Datapath.forwardResult before
-// an Action ever reaches here, so dst is always a real remote peer. It's a
-// single-packet call onto sendOverTunnelBatch's connect/write/retry logic;
-// unlike runOutgoingBatch's calls, this can run on several replay goroutines
-// at once (see retainForReplay), so it can't share runOutgoingBatch's
-// scratch outgoingBatch and gets its own per-call instead.
+// sendOverTunnel sends packetBytes to dst over the tunnel. dst is always a
+// real remote peer - Datapath.forwardResult handles local delivery and
+// invalid hosts before an Action gets here. Unlike runOutgoingBatch, this can
+// run on several replay goroutines at once, so it gets its own scratch
+// outgoingBatch rather than sharing runOutgoingBatch's.
 func (t *Tunnel) sendOverTunnel(dst netip.AddrPort, packetBytes []byte, attemptNumber int) {
 	t.sendOverTunnelBatch(dst, [][]byte{packetBytes}, &outgoingBatch{}, attemptNumber)
 }
 
 // sendOverTunnelBatch sends bufs to dst, resolving dst's tunnelConn once for
-// the whole group instead of once per packet - the amortisation this whole
-// change is for - and writing them with as few WriteBatch calls as the
-// connection's platform allows (see batchWriter). scratch is where messages
-// are built for the underlying WriteBatch call; the caller (runOutgoingBatch)
-// owns it and reuses it across every destination and every batch, so this
-// never allocates in steady state.
+// the whole group rather than once per packet. scratch is reused by the
+// caller across every destination and batch, so this never allocates in
+// steady state.
 //
-// A write failure redials exactly as sendOverTunnel does: the dead connection
-// is evicted, a fresh one is dialled, and whatever of the group didn't make
-// it out yet is retried on it, up to the same 10-retry cap - so one peer
-// being down costs that peer's group some latency, never the other groups in
-// the same batch, which are already independent loop iterations by the time
-// this runs (see runOutgoingBatch). A platform whose WriteBatch can only ever
-// accept one message per call (see ipv4/ipv6's doc on that) is not a
-// failure - the loop just keeps calling it until the group drains.
+// A write failure evicts the dead connection, dials a fresh one, and retries
+// whatever didn't make it out, up to a 10-retry cap - so one peer being down
+// only costs that peer's group latency, not the rest of the batch.
 func (t *Tunnel) sendOverTunnelBatch(dst netip.AddrPort, bufs [][]byte, scratch *outgoingBatch, attemptNumber int) {
 	if attemptNumber > 10 || len(bufs) == 0 {
 		return
@@ -530,9 +467,8 @@ func (t *Tunnel) sendOverTunnelBatch(dst netip.AddrPort, bufs [][]byte, scratch 
 		bufs = bufs[sent:]
 		if err == nil {
 			if sent == 0 {
-				// WriteBatch's contract only promises this can happen on
-				// error - treat a silent no-op the same way rather than
-				// spinning on the rest of the group forever.
+				// A silent no-op is only documented to happen on error -
+				// bail rather than spin on the rest of the group forever.
 				return
 			}
 			continue
@@ -552,9 +488,8 @@ func (t *Tunnel) sendOverTunnelBatch(dst netip.AddrPort, bufs [][]byte, scratch 
 }
 
 // dialAndStore installs a fresh connection for key, unless another goroutine
-// won the race to create one first - sendOverTunnel can now run on several
-// goroutines at once (see retainForReplay), and dropping a duplicate on the
-// floor would leak its socket.
+// won the race to create one first - dropping a duplicate on the floor would
+// leak its socket.
 func (t *Tunnel) dialAndStore(key netip.AddrPort) (*tunnelConn, error) {
 	connection, err := createUDPChannel(key)
 	if err != nil {
@@ -573,13 +508,10 @@ func (t *Tunnel) dialAndStore(key netip.AddrPort) (*tunnelConn, error) {
 }
 
 // newTunnelConn wraps a freshly dialled peer connection with the batched
-// writer its address family needs. Unlike the listen socket - always
-// dual-stack, see udpTunnelSocket - a socket net.DialUDP dials to one
-// specific remote address is single-family, and dst.Addr() is never a
-// v4-mapped v6 address here (see TableEntryCache.AddrFromIP's Unmap), so
-// checking Is4() reliably tells the two apart. A node can have peers of both
-// kinds at once, which is why this is decided per connection rather than
-// once for the whole Tunnel.
+// writer its address family needs. Unlike the listen socket (always
+// dual-stack, see udpTunnelSocket), a net.DialUDP connection is single-family,
+// and dst.Addr() is never a v4-mapped v6 address here (see
+// TableEntryCache.AddrFromIP's Unmap), so Is4() reliably tells the two apart.
 func newTunnelConn(conn *net.UDPConn, dst netip.AddrPort) *tunnelConn {
 	var bw batchWriter
 	if dst.Addr().Is4() {
@@ -592,9 +524,8 @@ func newTunnelConn(conn *net.UDPConn, dst netip.AddrPort) *tunnelConn {
 	return tc
 }
 
-// startConnectionEviction closes tunnel sockets that have gone unused, so the
-// descriptor and socket-buffer cost of talking to a node once doesn't persist
-// for the lifetime of the process.
+// startConnectionEviction periodically closes tunnel sockets that have gone
+// unused, so talking to a node once doesn't hold its descriptor forever.
 func (t *Tunnel) startConnectionEviction() {
 	ticker := time.NewTicker(connectionSweepInterval)
 	go func() {
@@ -615,9 +546,8 @@ func (t *Tunnel) evictIdleConnections(timeout time.Duration) {
 		if con.lastUsed.Load() > cutoff {
 			continue
 		}
-		// Identity check, as in sendOverTunnel's error path: only remove the
-		// connection actually observed as idle, never a replacement that has
-		// since been dialled for the same peer.
+		// Only remove the connection actually observed as idle, never a
+		// replacement dialled for the same peer since.
 		if t.connectionBuffer[key] == con {
 			delete(t.connectionBuffer, key)
 			idle = append(idle, con)
@@ -645,24 +575,20 @@ func createUDPChannel(raddr netip.AddrPort) (*net.UDPConn, error) {
 	return connection, nil
 }
 
-// GetName returns the name of the tun interface
 func (t *Tunnel) GetName() string {
 	return t.HostTUNDeviceName
 }
 
-// GetErrCh returns the error channel
-// this channel sends all the errors of the tun device
 func (t *Tunnel) GetErrCh() <-chan error {
 	return t.errorChannel
 }
 
-// GetStopCh returns the errCh
-// this channel is used to stop the service. After a shutdown the TUN device stops listening
+// GetStopCh sends true to stop the tunnel's listeners.
 func (t *Tunnel) GetStopCh() chan<- bool {
 	return t.stopChannel
 }
 
-// GetFinishCh returns the confirmation that the channel stopped listening for packets
+// GetFinishCh confirms a listener has stopped after a stop signal.
 func (t *Tunnel) GetFinishCh() <-chan bool {
 	return t.finishChannel
 }

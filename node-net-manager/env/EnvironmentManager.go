@@ -98,9 +98,8 @@ func NewCustom(proxyname string, customConfig Configuration) *Environment {
 		mtusize:           customConfig.Mtusize,
 	}
 	result := &e
-	// The resolver needs to call back into IsServiceDeployed, so it is wired
-	// against the pointer this constructor hands out - not the local value -
-	// or its LocalDeployments would keep reading a copy nobody else touches.
+	// wire against the pointer, not e: the resolver calls back into
+	// IsServiceDeployed and must not see a stale copy of the Environment
 	result.resolver = resolver.New(result)
 
 	// Get Connected Internet Interface
@@ -459,9 +458,8 @@ func (env *Environment) CreateHostBridge() error {
 	return nil
 }
 
-// Resolver exposes the packet-path Service IP resolver, e.g. so the proxy can
-// be wired up to it and so it can be handed to mqtt as a
-// jobEnvironmentManagerActions.
+// Resolver exposes the packet-path Service IP resolver, so it can be wired
+// into the proxy and handed to mqtt as a jobEnvironmentManagerActions.
 func (env *Environment) Resolver() *resolver.ServiceResolver {
 	return env.resolver
 }
@@ -480,9 +478,8 @@ func (env *Environment) RemoveServiceEntries(jobname string) {
 	env.resolver.RemoveServiceEntries(jobname)
 }
 
-// RemoveNsIPEntry removes the translation table entry that owns ip. The
-// container/unikernel teardown paths call this directly with the address they
-// already hold, rather than through the resolver's job-name-keyed methods.
+// RemoveNsIPEntry removes the translation table entry owning ip, for callers
+// that already have the address rather than a job name.
 func (env *Environment) RemoveNsIPEntry(ip net.IP) error {
 	return env.resolver.RemoveNsIPEntry(ip)
 }

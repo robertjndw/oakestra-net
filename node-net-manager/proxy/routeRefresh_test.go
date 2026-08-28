@@ -29,14 +29,10 @@ func TestCachedRouteSurvivesUnchangedTable(t *testing.T) {
 	}
 }
 
-// TestCachedRouteRevalidatedOnce proves the generation tag actually skips the
-// replica scan once a route has been revalidated, not just that the fast path
-// exists: after the table moves, the first Route call has to scan
-// lookup.Entries to confirm the cached route survives - proven here by moving
-// the generation without disturbing the route, and checking it gets retagged.
-// The second call is handed a lookup whose Entries would fail that same scan;
-// it must still succeed, which is only possible if the generation match made
-// it skip the scan entirely.
+// TestCachedRouteRevalidatedOnce checks that a route survives one
+// revalidation scan after the table's generation moves, and that the next
+// call trusts the retagged generation instead of scanning again - the second
+// call is handed a lookup whose Entries would fail that scan if it ran.
 func TestCachedRouteRevalidatedOnce(t *testing.T) {
 	dp := getFakeDatapath()
 	environment := dp.environment.(*FakeEnv)
@@ -124,9 +120,8 @@ func TestCachedRouteDroppedWhenInstanceRemoved(t *testing.T) {
 	}
 }
 
-// TestIdleTunnelConnectionsEvicted: tunnel sockets used to be removed only
-// when a write to them failed, so talking to a node once kept its descriptor
-// and socket buffer for the lifetime of the process.
+// TestIdleTunnelConnectionsEvicted checks that a tunnel connection unused
+// past the idle timeout gets closed, while one still in use survives.
 func TestIdleTunnelConnectionsEvicted(t *testing.T) {
 	tunnel, _ := loopbackTunnel(t)
 

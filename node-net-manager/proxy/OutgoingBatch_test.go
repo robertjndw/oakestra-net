@@ -11,10 +11,9 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-// fakeBatchWriter counts WriteBatch calls and records every packet handed to
-// it, standing in for a real *ipv4.PacketConn/*ipv6.PacketConn (see
-// tunnelConn.batch) without opening a socket. If err is set, every call
-// fails after recording nothing sent - see TestOutgoingBatchOnePeerFailureDoesNotBlockOthers.
+// fakeBatchWriter stands in for a real *ipv4.PacketConn/*ipv6.PacketConn (see
+// tunnelConn.batch), counting calls and recording every packet handed to it.
+// If err is set, every call fails and records nothing.
 type fakeBatchWriter struct {
 	calls   int
 	written [][]byte
@@ -32,11 +31,9 @@ func (f *fakeBatchWriter) WriteBatch(ms []ipv4.Message, flags int) (int, error) 
 	return len(ms), nil
 }
 
-// fakeConn returns a tunnelConn whose batched writes go through writer, with
-// a real (if pointless) UDP socket behind conn - a write failure closes and
-// redials that socket exactly as the real path does (see sendOverTunnelBatch),
-// so conn has to be real even though nothing ever reads or writes through it
-// directly in these tests.
+// fakeConn returns a tunnelConn whose batched writes go through writer. conn
+// itself is a real (if unused) UDP socket, since a write failure closes and
+// redials it exactly as the real path does.
 func fakeConn(t testing.TB, writer batchWriter) *tunnelConn {
 	t.Helper()
 	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9})
@@ -47,10 +44,9 @@ func fakeConn(t testing.TB, writer batchWriter) *tunnelConn {
 	return &tunnelConn{conn: conn, batch: writer}
 }
 
-// TestOutgoingBatchAmortisesSyscalls is the acceptance check for this whole
-// change: N packets bound for K distinct destinations in one TunDevice
-// ReadBatch must reach the network through exactly K WriteBatch calls - one
-// per destination - not N single writes and not one per packet.
+// TestOutgoingBatchAmortisesSyscalls checks that N packets bound for K
+// distinct destinations in one TunDevice read reach the network through
+// exactly K WriteBatch calls, one per destination.
 func TestOutgoingBatchAmortisesSyscalls(t *testing.T) {
 	sock := &fakeTunnelSocket{}
 	tunDev := &fakeTunDevice{batchSize: 32}
@@ -92,9 +88,8 @@ func TestOutgoingBatchAmortisesSyscalls(t *testing.T) {
 }
 
 // TestOutgoingBatchCorrectAtBatchSizeOne covers the no-batching fallback
-// (Darwin always, an older Linux kernel sometimes): with room for exactly one
-// packet per read, every packet still has to be grouped and sent correctly,
-// just one ReadBatch call at a time rather than amortised across a read.
+// (Darwin always, an older Linux kernel sometimes): grouping and sending must
+// still work correctly with one ReadBatch call per packet.
 func TestOutgoingBatchCorrectAtBatchSizeOne(t *testing.T) {
 	sock := &fakeTunnelSocket{}
 	tunDev := &fakeTunDevice{batchSize: 1}
@@ -130,9 +125,7 @@ func TestOutgoingBatchCorrectAtBatchSizeOne(t *testing.T) {
 	if len(otherWriter.written) != 1 {
 		t.Errorf("node C received %d packets; want 1", len(otherWriter.written))
 	}
-	// At batch size 1 there is exactly one packet - and so exactly one
-	// destination - per read, so amortisation cannot kick in; each read still
-	// has to produce its own WriteBatch call.
+	// One packet per read means one WriteBatch call per read.
 	if serverWriter.calls != 2 {
 		t.Errorf("WriteBatch called %d times across node B's 2 single-packet reads; want 2", serverWriter.calls)
 	}
@@ -141,10 +134,10 @@ func TestOutgoingBatchCorrectAtBatchSizeOne(t *testing.T) {
 	}
 }
 
-// TestOutgoingBatchMixesLocalDeliveryAndForward proves the local-destination
-// shortcut (ActionDeliver) still works when a batch also contains packets
-// bound for a remote peer (ActionForward) - the two verdicts are handled by
-// completely different code paths in runOutgoingBatch and must not interfere.
+// TestOutgoingBatchMixesLocalDeliveryAndForward checks that a batch
+// containing both a locally-destined packet (ActionDeliver) and a
+// remote-bound one (ActionForward) delivers each correctly without the two
+// paths interfering.
 func TestOutgoingBatchMixesLocalDeliveryAndForward(t *testing.T) {
 	const (
 		selfVIP    = "10.30.255.240"
@@ -190,10 +183,9 @@ func TestOutgoingBatchMixesLocalDeliveryAndForward(t *testing.T) {
 	}
 }
 
-// TestOutgoingBatchOnePeerFailureDoesNotBlockOthers proves that one
-// destination's write failing does not stop the rest of the batch's other
-// destinations from being delivered - the groups in runOutgoingBatch's active
-// list are independent send attempts, not one all-or-nothing operation.
+// TestOutgoingBatchOnePeerFailureDoesNotBlockOthers checks that one
+// destination's write failing doesn't stop the batch's other destinations
+// from being delivered.
 func TestOutgoingBatchOnePeerFailureDoesNotBlockOthers(t *testing.T) {
 	sock := &fakeTunnelSocket{}
 	tunDev := &fakeTunDevice{batchSize: 4}
@@ -222,17 +214,9 @@ func TestOutgoingBatchOnePeerFailureDoesNotBlockOthers(t *testing.T) {
 	}
 }
 
-// TestNewTunnelConnPicksAddressFamily proves which of ipv4/ipv6 backs a
-// dialled tunnelConn's batched writer: a socket net.DialUDP dials to a
-// specific remote address is single-family, unlike the always-dual-stack
-// listen socket (see udpTunnelSocket), and a node can have peers of both
-// kinds - so the wrapper has to be chosen per connection from dst's own
-// family, not fixed for the whole Tunnel.
-//
-// Sending real datagrams over both an IPv4 and an IPv6 loopback peer and
-// reading both back, plus asserting the concrete wrapper type each got, is
-// the proof: guessing the family backwards would either fail to construct a
-// working connection or silently pick the wrong wrapper.
+// TestNewTunnelConnPicksAddressFamily checks that a dialled tunnelConn gets
+// an ipv4.PacketConn or ipv6.PacketConn matching its peer's address family,
+// by sending real datagrams over both an IPv4 and IPv6 loopback peer.
 func TestNewTunnelConnPicksAddressFamily(t *testing.T) {
 	v4Listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {

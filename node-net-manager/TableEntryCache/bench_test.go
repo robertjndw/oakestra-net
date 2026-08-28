@@ -7,8 +7,7 @@ import (
 	"testing"
 )
 
-// populatedTable builds a table with n entries, each with a distinct NsIP
-// and ServiceIP, to measure lookup cost as the table grows.
+// n entries, each with a distinct NsIP and ServiceIP
 func populatedTable(n int) *TableManager {
 	table := NewTableManager()
 	for i := range n {

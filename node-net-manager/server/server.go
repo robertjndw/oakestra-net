@@ -157,8 +157,7 @@ func register(writer http.ResponseWriter, request *http.Request) {
 	// initialize the Env Manager
 	Env = env.NewEnvironmentClusterConfigured(Proxy.HostTUNDeviceName)
 
-	// The resolver must be wired up before the read loops start, so Datapath
-	// never sees a nil resolver on the packet path.
+	// must be set before Listen starts the read loops, or Datapath sees a nil resolver
 	Proxy.SetResolver(Env.Resolver())
 	Proxy.Listen()
 

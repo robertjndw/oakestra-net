@@ -125,9 +125,7 @@ func (t *Tunnel) Listen() {
 
 // create an instance of the proxy TUN device and setup the environment
 func (t *Tunnel) createTun() {
-	// CreateTUN both creates the device and sets its MTU, so there is no
-	// separate "ip link set mtu" step below the way there used to be with
-	// water.
+	// CreateTUN sets the MTU too, so there's no separate "ip link set mtu" step.
 	dev, err := tun.CreateTUN(t.HostTUNDeviceName, t.mtu)
 	if err != nil {
 		log.Fatalf("Unable to create new TUN/TAP interface: %s", err)

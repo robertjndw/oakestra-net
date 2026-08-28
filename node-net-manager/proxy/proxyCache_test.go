@@ -70,10 +70,9 @@ func routeGenOf(t *testing.T, dp *Datapath, protocol uint8, srcIP, srcInstanceIP
 	return 0
 }
 
-// TestFlowCacheTwoServiceIPsSameSourcePort covers the collision the cache used
-// to have: entries were considered identical on destination port alone within
-// a source-port bucket, so opening a second flow from the same local socket to
-// a different Service VIP on the same port destroyed the first mapping.
+// TestFlowCacheTwoServiceIPsSameSourcePort: two flows from the same local
+// socket to different Service VIPs on the same destination port must not
+// collide in the same source-port bucket.
 func TestFlowCacheTwoServiceIPsSameSourcePort(t *testing.T) {
 	dp := getFakeDatapath()
 

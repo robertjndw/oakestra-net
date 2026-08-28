@@ -12,8 +12,7 @@ import (
 )
 
 // These benchmarks exercise the packet-translation hot path exactly as the
-// datapath goroutines call it. b.ReportAllocs() is the acceptance check for
-// the zero-copy rewrite: this should show 0 allocs/op.
+// datapath goroutines call it and should show 0 allocs/op.
 
 func benchmarkOutgoing(b *testing.B, wire []byte) {
 	dp := getFakeDatapath()
@@ -120,8 +119,7 @@ func BenchmarkHandleOutgoingLoopback(b *testing.B) {
 }
 
 // BenchmarkFlowCacheParallel exercises the striped locks with both datapath
-// directions running at once, which is what the replay goroutines and the
-// eviction sweep made possible.
+// directions running at once.
 func BenchmarkFlowCacheParallel(b *testing.B) {
 	dp := getFakeDatapath()
 	outgoing := buildTestPacketV4(b, clientNsIP, serverVIP, 40000, 443)
@@ -146,9 +144,8 @@ func BenchmarkFlowCacheParallel(b *testing.B) {
 }
 
 // BenchmarkOutgoingProxyReplicas shows the cost of a warm cache hit as the
-// service's replica count grows. Revalidating a cached route used to scan
-// every replica on every packet; while the table is unchanged that scan is
-// skipped entirely.
+// service's replica count grows: the revalidation scan is skipped entirely
+// while the table generation is unchanged.
 func BenchmarkOutgoingProxyReplicas(b *testing.B) {
 	for _, replicas := range []int{1, 10, 100, 1000} {
 		b.Run(fmt.Sprintf("replicas=%d", replicas), func(b *testing.B) {
@@ -175,13 +172,10 @@ func BenchmarkOutgoingProxyReplicas(b *testing.B) {
 	}
 }
 
-// BenchmarkOutgoingProxyRegeneration shows the cost of the other cache hit -
+// BenchmarkOutgoingProxyRegeneration shows the cost of the other cache hit:
 // one whose route was chosen under a generation the table has since moved
-// past, forcing exactly one revalidation scan against the service's replicas
-// before the route can be reused. This is where ProxyCache.Route's single
-// lock/scan pays off over the old three-call protocol (RetrieveByServiceIP,
-// IsRouteStillValid, MarkRouteCurrent), which took the lock three times and
-// scanned the bucket three times for the same outcome.
+// past, forcing one revalidation scan against the service's replicas before
+// the route can be reused.
 func BenchmarkOutgoingProxyRegeneration(b *testing.B) {
 	for _, replicas := range []int{1, 10, 100, 1000} {
 		b.Run(fmt.Sprintf("replicas=%d", replicas), func(b *testing.B) {
@@ -208,11 +202,8 @@ func BenchmarkOutgoingProxyRegeneration(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				// A generation Route hasn't tagged the entry with yet forces
-				// the revalidation scan on this call; Route then retags the
-				// entry with it, so the next iteration has to hand it a
-				// fresh one too, keeping every call on the regeneration path
-				// instead of just the first.
+				// A fresh, never-tagged generation each iteration forces the
+				// revalidation scan every time, not just on the first call.
 				stale := resolver.ServiceLookup{Entries: lookup.Entries, Generation: lookup.Generation + 1 + uint64(i)}
 				if _, ok := dp.proxycache.Route(key, stale); !ok {
 					b.Fatal("expected the route to revalidate")
@@ -222,10 +213,9 @@ func BenchmarkOutgoingProxyRegeneration(b *testing.B) {
 	}
 }
 
-// benchNoopBatchWriter counts WriteBatch calls without copying the packets
-// it's handed, unlike fakeBatchWriter - that copy exists for the correctness
-// tests' assertions, and would otherwise dominate an allocation count that's
-// supposed to isolate the batching machinery itself, not the test double.
+// benchNoopBatchWriter counts WriteBatch calls without copying the packets,
+// unlike fakeBatchWriter - that copy would dominate the allocation count
+// this benchmark is meant to isolate.
 type benchNoopBatchWriter struct{ calls int }
 
 func (w *benchNoopBatchWriter) WriteBatch(ms []ipv4.Message, flags int) (int, error) {
@@ -233,13 +223,10 @@ func (w *benchNoopBatchWriter) WriteBatch(ms []ipv4.Message, flags int) (int, er
 	return len(ms), nil
 }
 
-// BenchmarkOutgoingBatchGrouping isolates the cost this whole change is for:
-// grouping one TunDevice read's ActionForward packets by destination and
-// issuing one WriteBatch per group, with real sends stubbed out so the number
-// measured is the batching machinery itself, not socket I/O. b.ReportAllocs()
-// is the check that grouping N packets across a steady set of destinations
-// never allocates once the batch's buffers, groups and message scratch have
-// grown to fit (see outgoingBatch).
+// BenchmarkOutgoingBatchGrouping measures grouping one TunDevice read's
+// ActionForward packets by destination and issuing one WriteBatch per group,
+// with real sends stubbed out. Should show 0 allocs/op once the batch's
+// buffers, groups and message scratch have grown to fit (see outgoingBatch).
 func BenchmarkOutgoingBatchGrouping(b *testing.B) {
 	sock := &fakeTunnelSocket{}
 	tunDev := &fakeTunDevice{batchSize: 32}
@@ -258,18 +245,13 @@ func BenchmarkOutgoingBatchGrouping(b *testing.B) {
 
 	batch := newOutgoingBatch(tunDev.BatchSize())
 
-	// readQueue is refilled every iteration below by reassigning this same
-	// backing array, never by re-appending: fakeTunDevice.ReadBatch drains
-	// its own copy of the slice header by reslicing off the front
-	// (f.readQueue = f.readQueue[1:]), which never touches this one, so
-	// resetting tunDev.readQueue = readQueue costs nothing once readQueue
-	// itself is built. Rebuilding it with append every iteration would
-	// measure that rebuild, not the grouping machinery under test.
+	// fakeTunDevice.ReadBatch drains readQueue by reslicing off the front, so
+	// reassigning tunDev.readQueue = readQueue each iteration below is free -
+	// rebuilding it with append every time would measure that rebuild instead.
 	readQueue := append([][]byte(nil), packets...)
 
-	// Warm the batch's grouping map, per-destination buffer slices and
-	// message scratch, so the measured loop is the steady state - see
-	// outgoingBatch's own comments on why none of that grows again afterwards.
+	// Warm the batch's grouping map, buffer slices and message scratch so the
+	// measured loop is the steady state.
 	tunDev.readQueue = readQueue
 	if err := tunnel.runOutgoingBatch(batch); err != nil {
 		b.Fatal(err)
