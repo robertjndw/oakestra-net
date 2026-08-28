@@ -23,7 +23,7 @@ func BenchmarkOutgoingProxyV4(b *testing.B) {
 		if !ok || !pkt.HasTransport() {
 			b.Fatal("parse failed")
 		}
-		if _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
+		if _, _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
 			b.Fatal("expected packet to be proxied")
 		}
 	}
@@ -42,7 +42,7 @@ func BenchmarkOutgoingProxyV6(b *testing.B) {
 		if !ok || !pkt.HasTransport() {
 			b.Fatal("parse failed")
 		}
-		if _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
+		if _, _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
 			b.Fatal("expected packet to be proxied")
 		}
 	}

@@ -19,13 +19,18 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
-	"golang.org/x/sync/singleflight"
 )
 
 const NamespaceAlreadyDeclared string = "namespace already declared"
 
 type EnvironmentManager interface {
-	GetTableEntryByServiceIP(ip net.IP) []TableEntryCache.TableEntry
+	// GetTableEntryByServiceIP returns the entries for ip. On a miss it starts
+	// background resolution and returns a channel that is closed when that attempt
+	// completes, so the caller can hold the packet and retry instead of losing it;
+	// the channel is nil when no resolution is running and the packet should just
+	// be dropped. Resolution needs a blocking MQTT round trip and must never
+	// happen on the packet path - see resolveServiceIPOnce.
+	GetTableEntryByServiceIP(ip net.IP) ([]TableEntryCache.TableEntry, <-chan struct{})
 	GetTableEntryByNsIP(ip net.IP) (TableEntryCache.TableEntry, bool)
 	GetTableEntryByInstanceIP(ip net.IP) (TableEntryCache.TableEntry, bool)
 }
@@ -51,11 +56,11 @@ type Environment struct {
 	proxyName         string
 	config            Configuration
 	translationTable  TableEntryCache.TableManager
-	// resolveGroup/failedServiceIPs dedup and rate-limit background
-	// table-query resolution on a ServiceIP miss (see GetTableEntryByServiceIP).
-	// Zero values are ready to use, no constructor changes needed.
-	resolveGroup     singleflight.Group // dedupes concurrent resolutions of the same ServiceIP
-	failedServiceIPs sync.Map           // ip.String() -> time.Time of the last failed attempt
+	// resolveLock guards pendingResolves and failedServiceIPs. Both maps are
+	// created lazily so the zero Environment stays usable.
+	resolveLock      sync.Mutex
+	pendingResolves  map[string]chan struct{} // ServiceIP -> closed when its in-flight resolution finishes
+	failedServiceIPs map[string]time.Time     // ServiceIP -> when resolution last failed
 	//### Deployment management variables
 	deployedServices     map[string]service // all the deployed services with the ip and ports
 	deployedServicesLock sync.RWMutex
@@ -481,55 +486,111 @@ func (env *Environment) GetTableEntriesOnNode() []TableEntryCache.TableEntry {
 // in-flight marker clears.
 const negativeResolveCacheTTL = 2 * time.Second
 
+// maxConcurrentResolves bounds how many table queries may be in flight at
+// once. Each one blocks up to 5s on an MQTT round trip, so without a cap a
+// host scanning the proxy subnetwork - trivially large in the IPv6 range -
+// would cost one goroutine and one broker request per distinct destination.
+const maxConcurrentResolves = 32
+
+// maxFailedServiceIPs caps the negative cache so the same scan can't grow
+// it without bound.
+const maxFailedServiceIPs = 1024
+
 // GetTableEntryByServiceIP Given a ServiceIP this method performs a search in the local ServiceCache
 // If the entry is not present, resolution is kicked off in the background and this call returns
-// nothing for the current packet - see resolveServiceIPOnce for why this must not block.
-func (env *Environment) GetTableEntryByServiceIP(ip net.IP) []TableEntryCache.TableEntry {
+// the channel that signals its completion - see resolveServiceIPOnce for why this must not block.
+func (env *Environment) GetTableEntryByServiceIP(ip net.IP) ([]TableEntryCache.TableEntry, <-chan struct{}) {
 	// If entry already available
 	table := env.translationTable.SearchByServiceIP(ip)
 	if len(table) > 0 {
 		// mark the job as just used, so its MQTT interest doesn't expire
 		table[0].Touch()
-		return table
+		return table, nil
 	}
 
 	// Miss: resolving requires a blocking MQTT round trip (up to ~5s, see
 	// mqtt.Tablequery). This is called from the single outgoing-packet
 	// goroutine, so doing that inline here would stall every flow on the
 	// node, not just this one. Drop this packet and resolve in the
-	// background instead; a TCP retransmit (or application-level UDP retry)
-	// will go through once the entry lands in the table.
-	env.resolveServiceIPOnce(ip)
-	return nil
+	// background instead; the caller can hang onto it and retry once the
+	// returned channel closes, or let a TCP retransmit go through.
+	return nil, env.resolveServiceIPOnce(ip)
 }
 
-// resolveServiceIPOnce kicks off background resolution for ip, unless a
-// query for it is already in flight or one failed too recently (see
-// negativeResolveCacheTTL). This bounds a packet storm against an
-// unresolvable ServiceIP to roughly one query per negativeResolveCacheTTL +
-// the query's own timeout, instead of one per packet.
-func (env *Environment) resolveServiceIPOnce(ip net.IP) {
+// resolveServiceIPOnce starts background resolution for ip and returns a
+// channel that is closed once the attempt finishes, so a caller can hold onto
+// the packet that triggered it. Returns nil when no attempt is running: a
+// recent one already failed (see negativeResolveCacheTTL) or too many are
+// already in flight, in which case the caller should drop the packet.
+func (env *Environment) resolveServiceIPOnce(ip net.IP) <-chan struct{} {
 	key := ip.String()
 
-	if failedAt, ok := env.failedServiceIPs.Load(key); ok {
-		if time.Since(failedAt.(time.Time)) < negativeResolveCacheTTL {
-			return
+	env.resolveLock.Lock()
+
+	if done, ok := env.pendingResolves[key]; ok {
+		env.resolveLock.Unlock()
+		return done
+	}
+
+	if failedAt, ok := env.failedServiceIPs[key]; ok {
+		if time.Since(failedAt) < negativeResolveCacheTTL {
+			env.resolveLock.Unlock()
+			return nil
 		}
 	}
 
-	// DoChan dedupes concurrent resolutions of the same key and runs the
-	// call in its own goroutine, so - like the sync.Map + go func it
-	// replaces - this never blocks the caller (the packet-handling
-	// goroutine, see GetTableEntryByServiceIP).
-	env.resolveGroup.DoChan(key, func() (interface{}, error) {
+	if len(env.pendingResolves) >= maxConcurrentResolves {
+		env.resolveLock.Unlock()
+		return nil
+	}
+
+	if env.pendingResolves == nil {
+		env.pendingResolves = make(map[string]chan struct{})
+	}
+	done := make(chan struct{})
+	env.pendingResolves[key] = done
+	env.resolveLock.Unlock()
+
+	go func() {
 		err := env.resolveServiceIP(ip)
+
+		env.resolveLock.Lock()
+		delete(env.pendingResolves, key)
 		if err != nil {
-			env.failedServiceIPs.Store(key, time.Now())
+			env.rememberFailureLocked(key)
 		} else {
-			env.failedServiceIPs.Delete(key)
+			delete(env.failedServiceIPs, key)
 		}
-		return nil, err
-	})
+		env.resolveLock.Unlock()
+
+		close(done)
+	}()
+
+	return done
+}
+
+// rememberFailureLocked records a failed resolution, first sweeping expired
+// entries and - if every entry is still fresh - dropping the map wholesale
+// rather than letting it grow. Worst case that costs a handful of ServiceIPs
+// one extra query each.
+func (env *Environment) rememberFailureLocked(key string) {
+	if env.failedServiceIPs == nil {
+		env.failedServiceIPs = make(map[string]time.Time)
+	}
+
+	if len(env.failedServiceIPs) >= maxFailedServiceIPs {
+		now := time.Now()
+		for k, failedAt := range env.failedServiceIPs {
+			if now.Sub(failedAt) >= negativeResolveCacheTTL {
+				delete(env.failedServiceIPs, k)
+			}
+		}
+		if len(env.failedServiceIPs) >= maxFailedServiceIPs {
+			env.failedServiceIPs = make(map[string]time.Time)
+		}
+	}
+
+	env.failedServiceIPs[key] = time.Now()
 }
 
 // resolveServiceIP performs the actual (blocking) table query and populates

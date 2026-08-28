@@ -16,8 +16,9 @@ type ConversionEntry struct {
 	srcport       int
 	dstport       int
 	// dstNode/dstNodePort cache which node dstip actually lives on, so the
-	// packet path doesn't need a second table lookup by namespace IP once a
-	// flow has an entry here - see outgoingProxy.
+	// packet path doesn't need a second table lookup by namespace IP -
+	// outgoingProxy instead revalidates this cached tuple (dstip, dstNode,
+	// dstNodePort) against the translation table on every cache hit.
 	dstNode     netip.Addr
 	dstNodePort int
 }

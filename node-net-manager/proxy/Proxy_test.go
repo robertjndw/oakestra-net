@@ -4,7 +4,6 @@ import (
 	"NetManager/TableEntryCache"
 	"NetManager/proxy/iputils"
 	"encoding/hex"
-	"math/rand"
 	"net"
 	"net/netip"
 	"testing"
@@ -19,7 +18,7 @@ type FakeEnv struct {
 // used as example packets for testing
 var ipv6Packet string = "600219310028063ffc000000000000000000000000000203fdff1000000000000000000000000001b98400502a8697ed00000000a002ff322a8900000204056e0402080a7fb1168c0000000001030307"
 
-func (fakeenv *FakeEnv) GetTableEntryByServiceIP(ip net.IP) []TableEntryCache.TableEntry {
+func (fakeenv *FakeEnv) GetTableEntryByServiceIP(ip net.IP) ([]TableEntryCache.TableEntry, <-chan struct{}) {
 	entrytable := make([]TableEntryCache.TableEntry, 0)
 	//If entry already available
 	entry := TableEntryCache.TableEntry{
@@ -44,7 +43,7 @@ func (fakeenv *FakeEnv) GetTableEntryByServiceIP(ip net.IP) []TableEntryCache.Ta
 			}},
 	}
 	entrytable = append(entrytable, entry)
-	return entrytable
+	return entrytable, nil
 }
 
 func (fakeenv *FakeEnv) GetTableEntryByNsIP(ip net.IP) (TableEntryCache.TableEntry, bool) {
@@ -89,7 +88,6 @@ func getFakeTunnel() *GoProxyTunnel {
 		TunnelPort:        50011,
 		listenConnection:  nil,
 		proxycache:        NewProxyCache(),
-		randseed:          rand.New(rand.NewSource(42)),
 		tunNetIPv6:        "fdfe::1337",
 		ProxyIPv6Subnetwork: net.IPNet{
 			IP:   net.ParseIP("fdff::"),
@@ -166,11 +164,11 @@ func TestOutgoingProxy(t *testing.T) {
 	pkt := parseTestPacket(t, buildTestPacketV4(t, "10.19.1.1", "10.30.255.255", 666, 80))
 	noProxyPkt := parseTestPacket(t, buildTestPacketV4(t, "10.19.1.1", "10.20.1.1", 666, 80))
 
-	if _, _, proxied := proxy.outgoingProxy(&noProxyPkt); proxied {
+	if _, _, _, proxied := proxy.outgoingProxy(&noProxyPkt); proxied {
 		t.Error("Packet should not be proxied")
 	}
 
-	if _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
+	if _, _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
 		t.Fatal("packet should have been proxied")
 	}
 	dstexpected := netip.MustParseAddr("10.19.2.12")
@@ -215,11 +213,11 @@ func TestOutgoingV6Proxy(t *testing.T) {
 	pkt := parseTestPacket(t, buildTestPacketV6(t, "fc00::1", "fdff:2000::ff", 666, 80))
 	noProxyPkt := parseTestPacket(t, buildTestPacketV6(t, "fc00::1", "fd00::12", 666, 80))
 
-	if _, _, proxied := proxy.outgoingProxy(&noProxyPkt); proxied {
+	if _, _, _, proxied := proxy.outgoingProxy(&noProxyPkt); proxied {
 		t.Error("Packet should not be proxied")
 	}
 
-	if _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
+	if _, _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
 		t.Fatal("packet should have been proxied")
 	}
 	dstexpected := netip.MustParseAddr("fd00::12")

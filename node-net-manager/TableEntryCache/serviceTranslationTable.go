@@ -298,9 +298,26 @@ func (t *TableManager) isValid(entry TableEntry) bool {
 	return true
 }
 
-func IsNamespaceStillValid(nsip net.IP, table *[]TableEntry) bool {
-	for _, entry := range *table {
-		if entry.Nsip.Equal(nsip) || entry.Nsipv6.Equal(nsip) {
+// IsRouteStillValid checks whether the full cached route (namespace IP, node
+// IP and node port) still matches an entry in table. Checking nsip alone is
+// not enough: a route refresh can reassign an instance to a different node
+// while its Nsip/Nsipv6 stays the same, and a cache hit that only compares
+// nsip would then keep tunnelling to the stale node forever (cache hits
+// refresh lastUsed, so a stale-but-active flow never ages out on its own).
+func IsRouteStillValid(nsip netip.Addr, nodeip netip.Addr, nodeport int, table []TableEntry) bool {
+	for i := range table {
+		entry := &table[i]
+		if entry.Nodeport != nodeport {
+			continue
+		}
+		entryNodeip, ok := AddrFromIP(entry.Nodeip)
+		if !ok || entryNodeip != nodeip {
+			continue
+		}
+		if entryNsip, ok := AddrFromIP(entry.Nsip); ok && entryNsip == nsip {
+			return true
+		}
+		if entryNsipv6, ok := AddrFromIP(entry.Nsipv6); ok && entryNsipv6 == nsip {
 			return true
 		}
 	}

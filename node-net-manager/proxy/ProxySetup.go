@@ -7,13 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"strconv"
-	"time"
 
 	"github.com/songgao/water"
 )
@@ -59,10 +57,6 @@ func NewCustom(configuration Configuration) *GoProxyTunnel {
 		connectionBuffer: make(map[netip.AddrPort]*net.UDPConn),
 		proxycache:       NewProxyCache(),
 		mtusize:          strconv.Itoa(configuration.Mtusize),
-		// Seeded per-process (not with a fixed value) so every node picks a
-		// different round-robin sequence; a shared fixed seed meant every
-		// node made the exact same load-balancing choice.
-		randseed: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
 	// parse configuration file

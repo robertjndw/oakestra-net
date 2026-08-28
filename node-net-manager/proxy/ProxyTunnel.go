@@ -5,10 +5,11 @@ import (
 	"NetManager/env"
 	"NetManager/logger"
 	"NetManager/proxy/iputils"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
 	"github.com/songgao/water"
 )
@@ -43,7 +44,6 @@ type GoProxyTunnel struct {
 	environment         env.EnvironmentManager
 	listenConnection    *net.UDPConn
 	connectionBuffer    map[netip.AddrPort]*net.UDPConn
-	randseed            *rand.Rand
 	ifce                *water.Interface
 	finishChannel       chan bool
 	errorChannel        chan error
@@ -86,8 +86,11 @@ func putPacketBuf(b *[]byte) {
 
 // handleOutgoing processes one packet read from the TUN device: translate it
 // (if it targets the semantic-routing subnetwork) and forward it on. buf is
-// only used for the duration of this call.
-func (proxy *GoProxyTunnel) handleOutgoing(buf []byte) {
+// only used for the duration of this call, unless it ends up retained for
+// replay (see retainForReplay). mayRetain must be false when called from a
+// replay goroutine itself - otherwise a resolution that succeeds but still
+// yields no matching table entry would re-enter and replay forever.
+func (proxy *GoProxyTunnel) handleOutgoing(buf []byte, mayRetain bool) {
 	pkt, ok := iputils.Parse(buf)
 	if !ok || !pkt.HasTransport() {
 		return
@@ -96,11 +99,46 @@ func (proxy *GoProxyTunnel) handleOutgoing(buf []byte) {
 		logger.DebugLogger().Printf("Outgoing packet:\t\t\t%s ---> %s\n", pkt.SrcIP(), pkt.DstIP())
 	}
 
-	dstHost, dstPort, ok := proxy.outgoingProxy(&pkt)
+	dstHost, dstPort, resolving, ok := proxy.outgoingProxy(&pkt)
 	if !ok {
+		if mayRetain && resolving != nil {
+			proxy.retainForReplay(buf, resolving)
+		}
 		return
 	}
 	proxy.forward(dstHost, dstPort, pkt.Bytes(), 0)
+}
+
+// maxPendingReplayPackets bounds how many packets may be held at once waiting
+// for their destination ServiceIP to resolve.
+const maxPendingReplayPackets = 256
+
+var pendingReplayCount atomic.Int32
+
+// retainForReplay holds a copy of a packet whose ServiceIP is still being
+// resolved and re-runs it once resolution finishes. Resolution can't happen on
+// the packet path, so without this the first packet of every cold flow is
+// lost: harmless for TCP, which retransmits, but it silently drops a one-shot
+// UDP datagram whose only fault was arriving before its route.
+func (proxy *GoProxyTunnel) retainForReplay(buf []byte, resolving <-chan struct{}) {
+	if pendingReplayCount.Add(1) > maxPendingReplayPackets {
+		pendingReplayCount.Add(-1)
+		return
+	}
+
+	// buf belongs to outgoingLoop's pool and is reused as soon as
+	// handleOutgoing returns, so it must be copied before we hang onto it
+	// past this call.
+	cp := getPacketBuf()
+	*cp = (*cp)[:len(buf)]
+	copy(*cp, buf)
+
+	go func() {
+		defer pendingReplayCount.Add(-1)
+		defer putPacketBuf(cp)
+		<-resolving
+		proxy.handleOutgoing(*cp, false)
+	}()
 }
 
 // handleIngoing processes one packet received on the tunnel UDP socket (or
@@ -129,8 +167,11 @@ func (proxy *GoProxyTunnel) handleIngoing(buf []byte) {
 // semantic-routing subnetwork, resolving the target instance via the
 // translation table (proxy.environment) and the per-flow ProxyCache. ok is
 // false if the packet isn't part of the proxy subnetwork, or its ServiceIP
-// can't currently be resolved - either way it should be dropped.
-func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, dstPort int, ok bool) {
+// can't currently be resolved - either way it should be dropped. resolving is
+// non-nil only when the ServiceIP is still being resolved in the background
+// (a cold miss), so the caller can hold onto the packet and retry once it
+// closes instead of losing it outright.
+func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, dstPort int, resolving <-chan struct{}, ok bool) {
 	dstIP := pkt.DstIP()
 	srcIP := pkt.SrcIP()
 	srcport := int(pkt.SrcPort())
@@ -144,28 +185,31 @@ func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, 
 		inProxySubnet = proxy.ProxyIPv6Subnetwork.Contains(dstIPNet)
 	}
 	if !inProxySubnet {
-		return nil, 0, false
+		return nil, 0, nil, false
 	}
 
 	// Check if the ServiceIP is known
-	tableEntryList := proxy.environment.GetTableEntryByServiceIP(dstIPNet)
+	tableEntryList, resolveCh := proxy.environment.GetTableEntryByServiceIP(dstIPNet)
 	if len(tableEntryList) < 1 {
-		return nil, 0, false
+		return nil, 0, resolveCh, false
 	}
 
 	// Find the instanceIP of the current service
 	instanceIP, ok := proxy.convertToInstanceIp(pkt.Version(), srcIP)
 	if !ok {
-		return nil, 0, false
+		return nil, 0, nil, false
 	}
 
 	// Check proxy proxycache (if any active flow is there already)
 	entry, exist := proxy.proxycache.RetrieveByServiceIP(srcIP, instanceIP, srcport, dstIP, dstport)
 
-	if !exist || entry.dstport < 1 || !TableEntryCache.IsNamespaceStillValid(netIPFromAddr(entry.dstip), &tableEntryList) {
+	if !exist || entry.dstport < 1 || !TableEntryCache.IsRouteStillValid(entry.dstip, entry.dstNode, entry.dstNodePort, tableEntryList) {
 		// Choose between the table entry according to the ServiceIP algorithm
 		// TODO: so far this only uses RR, ServiceIP policies should be implemented here
-		tableEntry := tableEntryList[proxy.randseed.Intn(len(tableEntryList))]
+		// rand.IntN (math/rand/v2) is safe to call concurrently and seeded
+		// per-process, unlike a shared *rand.Rand - needed now that replay
+		// goroutines (see retainForReplay) can call in here too.
+		tableEntry := tableEntryList[rand.IntN(len(tableEntryList))]
 
 		entryDstIPnet := tableEntry.Nsip
 		if pkt.Version() == 6 {
@@ -173,11 +217,11 @@ func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, 
 		}
 		entryDstIP, ok := TableEntryCache.AddrFromIP(entryDstIPnet)
 		if !ok {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
 		nodeAddr, ok := TableEntryCache.AddrFromIP(tableEntry.Nodeip)
 		if !ok {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
 
 		// Update proxycache. dstNode/dstNodePort are cached here too - an
@@ -198,9 +242,9 @@ func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, 
 	}
 
 	if !pkt.Rewrite(entry.srcInstanceIp, entry.dstip) {
-		return nil, 0, false
+		return nil, 0, nil, false
 	}
-	return netIPFromAddr(entry.dstNode), entry.dstNodePort, true
+	return netIPFromAddr(entry.dstNode), entry.dstNodePort, nil, true
 }
 
 // convertToInstanceIp resolves the stable "instance IP" that identifies
@@ -309,7 +353,7 @@ func (proxy *GoProxyTunnel) outgoingLoop(errchannel chan<- error) {
 			errchannel <- err
 			continue
 		}
-		proxy.handleOutgoing((*buf)[:n])
+		proxy.handleOutgoing((*buf)[:n], true)
 		putPacketBuf(buf)
 	}
 }
@@ -359,14 +403,11 @@ func (proxy *GoProxyTunnel) forward(dstHost net.IP, dstPort int, packetBytes []b
 	proxy.connectionBufferLock.RUnlock()
 
 	if !exist {
-		connection, err := createUDPChannel(key)
-		if nil != err {
+		var err error
+		con, err = proxy.dialAndStore(key)
+		if err != nil {
 			return
 		}
-		proxy.connectionBufferLock.Lock()
-		proxy.connectionBuffer[key] = connection
-		proxy.connectionBufferLock.Unlock()
-		con = connection
 	}
 
 	// net.UDPConn is safe for concurrent use - no lock needed around the
@@ -375,16 +416,42 @@ func (proxy *GoProxyTunnel) forward(dstHost net.IP, dstPort int, packetBytes []b
 	if err != nil {
 		_ = con.Close()
 		logger.ErrorLogger().Println(err)
-		connection, err := createUDPChannel(key)
-		if nil != err {
+
+		// con is confirmed dead - evict it so dialAndStore's double-check
+		// doesn't just hand it straight back. Guard on identity: another
+		// goroutine may have already replaced it with a live connection.
+		proxy.connectionBufferLock.Lock()
+		if proxy.connectionBuffer[key] == con {
+			delete(proxy.connectionBuffer, key)
+		}
+		proxy.connectionBufferLock.Unlock()
+
+		if _, err := proxy.dialAndStore(key); err != nil {
 			return
 		}
-		proxy.connectionBufferLock.Lock()
-		proxy.connectionBuffer[key] = connection
-		proxy.connectionBufferLock.Unlock()
 		// Try again
 		proxy.forward(dstHost, dstPort, packetBytes, attemptNumber+1)
 	}
+}
+
+// dialAndStore installs a fresh connection for key, unless another goroutine
+// won the race to create one first - forward() can now run on several
+// goroutines at once (see retainForReplay), and dropping a duplicate on the
+// floor would leak its socket.
+func (proxy *GoProxyTunnel) dialAndStore(key netip.AddrPort) (*net.UDPConn, error) {
+	connection, err := createUDPChannel(key)
+	if err != nil {
+		return nil, err
+	}
+
+	proxy.connectionBufferLock.Lock()
+	defer proxy.connectionBufferLock.Unlock()
+	if existing, exist := proxy.connectionBuffer[key]; exist {
+		_ = connection.Close()
+		return existing, nil
+	}
+	proxy.connectionBuffer[key] = connection
+	return connection, nil
 }
 
 func createUDPChannel(raddr netip.AddrPort) (*net.UDPConn, error) {
