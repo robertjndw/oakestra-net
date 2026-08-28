@@ -19,16 +19,16 @@ func parseTestPacket(t *testing.T, wire []byte) iputils.Packet {
 }
 
 func TestOutgoingProxy(t *testing.T) {
-	proxy := getFakeTunnel()
+	dp := getFakeDatapath()
 
 	pkt := parseTestPacket(t, buildTestPacketV4(t, clientNsIP, serverVIP, 666, 80))
 	noProxyPkt := parseTestPacket(t, buildTestPacketV4(t, clientNsIP, "10.20.1.1", 666, 80))
 
-	if _, _, _, proxied := proxy.outgoingProxy(&noProxyPkt); proxied {
+	if _, _, _, proxied := dp.outgoingProxy(&noProxyPkt); proxied {
 		t.Error("Packet should not be proxied")
 	}
 
-	if _, _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
+	if _, _, _, proxied := dp.outgoingProxy(&pkt); !proxied {
 		t.Fatal("packet should have been proxied")
 	}
 	if pkt.DstIP() != mustAddr(serverNsIP) {
@@ -40,10 +40,10 @@ func TestOutgoingProxy(t *testing.T) {
 }
 
 func TestIngoingProxy(t *testing.T) {
-	proxy := getFakeTunnel()
+	dp := getFakeDatapath()
 
 	// A reply for a flow this node originated: 10.19.1.1:666 -> serverVIP:80.
-	proxy.proxycache.Add(ConversionEntry{
+	dp.proxycache.Add(ConversionEntry{
 		srcip:         mustAddr(clientNsIP),
 		dstip:         mustAddr(serverNsIP),
 		dstServiceIp:  mustAddr(serverVIP),
@@ -57,11 +57,11 @@ func TestIngoingProxy(t *testing.T) {
 	pkt := parseTestPacket(t, buildTestPacketV4(t, serverInstIP, clientNsIP, 80, 666))
 	noProxyPkt := parseTestPacket(t, buildTestPacketV4(t, serverNsIP, "10.19.1.12", 666, 80))
 
-	if proxy.ingoingProxy(&noProxyPkt) {
+	if dp.ingoingProxy(&noProxyPkt) {
 		t.Error("Packet should not be proxied")
 	}
 
-	if !proxy.ingoingProxy(&pkt) {
+	if !dp.ingoingProxy(&pkt) {
 		t.Fatal("packet should have matched the reverse cache entry")
 	}
 	if pkt.SrcIP() != mustAddr(serverVIP) {
@@ -73,16 +73,16 @@ func TestIngoingProxy(t *testing.T) {
 }
 
 func TestOutgoingV6Proxy(t *testing.T) {
-	proxy := getFakeTunnel()
+	dp := getFakeDatapath()
 
 	pkt := parseTestPacket(t, buildTestPacketV6(t, clientNsIPv6, serverVIPv6, 666, 80))
 	noProxyPkt := parseTestPacket(t, buildTestPacketV6(t, clientNsIPv6, serverNsIPv6, 666, 80))
 
-	if _, _, _, proxied := proxy.outgoingProxy(&noProxyPkt); proxied {
+	if _, _, _, proxied := dp.outgoingProxy(&noProxyPkt); proxied {
 		t.Error("Packet should not be proxied")
 	}
 
-	if _, _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
+	if _, _, _, proxied := dp.outgoingProxy(&pkt); !proxied {
 		t.Fatal("packet should have been proxied")
 	}
 	if pkt.DstIP() != mustAddr(serverNsIPv6) {
@@ -91,9 +91,9 @@ func TestOutgoingV6Proxy(t *testing.T) {
 }
 
 func TestIngoingV6Proxy(t *testing.T) {
-	proxy := getFakeTunnel()
+	dp := getFakeDatapath()
 
-	proxy.proxycache.Add(ConversionEntry{
+	dp.proxycache.Add(ConversionEntry{
 		srcip:         mustAddr(clientNsIPv6),
 		dstip:         mustAddr(serverNsIPv6),
 		dstServiceIp:  mustAddr(serverVIPv6),
@@ -107,11 +107,11 @@ func TestIngoingV6Proxy(t *testing.T) {
 	pkt := parseTestPacket(t, buildTestPacketV6(t, serverInstIPv6, clientNsIPv6, 80, 666))
 	noProxyPkt := parseTestPacket(t, buildTestPacketV6(t, clientNsIPv6, serverNsIPv6, 666, 80))
 
-	if proxy.ingoingProxy(&noProxyPkt) {
+	if dp.ingoingProxy(&noProxyPkt) {
 		t.Error("Packet should not be proxied")
 	}
 
-	if !proxy.ingoingProxy(&pkt) {
+	if !dp.ingoingProxy(&pkt) {
 		t.Fatal("packet should have matched the reverse cache entry")
 	}
 	if pkt.SrcIP() != mustAddr(serverVIPv6) {
@@ -148,8 +148,8 @@ func TestRoundTrip(t *testing.T) {
 		{"ipv6", clientNsIPv6, clientInstIPv6, serverNsIPv6, serverInstIPv6, serverVIPv6, buildTestPacketV6},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			nodeA := fakeTunnelOn(nodeAIP)
-			nodeB := fakeTunnelOn(nodeBIP)
+			nodeA := fakeDatapathOn(nodeAIP, newFakeEnv())
+			nodeB := fakeDatapathOn(nodeBIP, newFakeEnv())
 
 			// 1. client sends to the service VIP; node A translates it.
 			req := parseTestPacket(t, tc.build(t, tc.clientNs, tc.serverVip, 40000, 80))

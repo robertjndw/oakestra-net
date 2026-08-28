@@ -1,30 +1,29 @@
 package proxy
 
 import (
+	"NetManager/TableEntryCache"
 	"NetManager/logger"
+	"NetManager/resolver"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// ConversionEntry is one translated flow. A flow is identified by the full
-// 5-tuple in both directions: identifying it by destination port alone (which
-// this cache used to do) collides as soon as one local socket talks to two
-// different Service VIPs on the same port - the common UDP shape - and lets a
-// reply for one VIP be reverse-translated as though it belonged to the other.
+// ConversionEntry is one translated flow, identified by the full 5-tuple in
+// both directions: destination port alone collides as soon as one local
+// socket talks to two different Service VIPs on the same port (the common UDP
+// shape), reverse-translating a reply for one VIP as though it belonged to
+// the other.
 type ConversionEntry struct {
 	srcip         netip.Addr
 	dstip         netip.Addr
 	dstServiceIp  netip.Addr
 	srcInstanceIp netip.Addr
-	// dstInstanceIp is the address the far end's replies will arrive from. It
-	// is not dstip: the remote node's own outgoingProxy translates the reply,
-	// because our srcInstanceIp is inside its proxy subnetwork too, so the
-	// reply is sourced from the target's instance IP. Without it the reverse
-	// lookup cannot tell two flows apart that share a local port and a remote
-	// port. Zero when the table entry has no InstanceNumber ServiceIP, which
-	// the reverse lookup treats as "matches any remote".
+	// dstInstanceIp is the address replies actually arrive from (not dstip:
+	// the remote node's outgoingProxy sources them from its own instance IP).
+	// Zero means "matches any remote" - used when the entry has no
+	// InstanceNumber ServiceIP to predict a reply source from.
 	dstInstanceIp netip.Addr
 	srcport       int
 	dstport       int
@@ -138,58 +137,97 @@ func (cache *ProxyCache) evictOldEntries(timeout time.Duration) {
 	}
 }
 
-// RetrieveByServiceIP looks up the outgoing flow for a packet leaving the
-// local namespace. tableGen is the current translation table generation; if it
-// still matches the one the route was chosen under, the caller can skip
-// revalidating the route against every replica.
-func (cache *ProxyCache) RetrieveByServiceIP(
-	protocol uint8, srcip netip.Addr, instanceIP netip.Addr, srcport int,
-	dstServiceIp netip.Addr, dstport int,
-) (ConversionEntry, bool) {
-	shard := shardOf(srcport)
+// Route is what the datapath needs from a cached flow: how to rewrite the
+// packet, and where to send it.
+type Route struct {
+	SrcInstanceIP netip.Addr
+	DstIP         netip.Addr
+	DstNode       netip.Addr
+	DstNodePort   int
+}
+
+// ReverseRoute is the equivalent for a reply being translated back.
+type ReverseRoute struct {
+	DstServiceIP netip.Addr
+	SrcIP        netip.Addr
+}
+
+// FlowKey identifies one flow: the full 5-tuple, as seen leaving the local
+// namespace. See ConversionEntry for why the full tuple, not just a port, is
+// what identifies a flow.
+type FlowKey struct {
+	Protocol                           uint8
+	SrcIP, SrcInstanceIP, DstServiceIP netip.Addr
+	SrcPort, DstPort                   int
+}
+
+// Route resolves the cached route for key. If the flow was chosen under a
+// generation older than lookup.Generation, it is revalidated against
+// lookup.Entries inside the same held lock and its generation refreshed - so
+// later packets on the same flow can skip the scan while the table stays
+// unchanged. One lock, one scan.
+func (cache *ProxyCache) Route(key FlowKey, lookup resolver.ServiceLookup) (Route, bool) {
+	shard := shardOf(key.SrcPort)
 	cache.locks[shard].Lock()
 	defer cache.locks[shard].Unlock()
 
-	bucket := &cache.cache[srcport]
+	bucket := &cache.cache[key.SrcPort]
 	for i := range bucket.entries {
 		entry := &bucket.entries[i]
-		if entry.protocol == protocol &&
-			entry.dstport == dstport &&
-			entry.dstServiceIp == dstServiceIp &&
-			entry.srcip == srcip &&
-			entry.srcInstanceIp == instanceIP {
-			entry.lastUsed = coarseClock.Load()
-			return *entry, true
+		if entry.protocol != key.Protocol ||
+			entry.dstport != key.DstPort ||
+			entry.dstServiceIp != key.DstServiceIP ||
+			entry.srcip != key.SrcIP ||
+			entry.srcInstanceIp != key.SrcInstanceIP {
+			continue
 		}
+		if entry.dstport < 1 {
+			return Route{}, false
+		}
+		if entry.routeGen != lookup.Generation {
+			// The table changed since this route was picked, so it has to be
+			// checked against the current replica set once. While the
+			// generation matches, that scan is skipped entirely.
+			if !TableEntryCache.IsRouteStillValid(entry.dstip, entry.dstNode, entry.dstNodePort, lookup.Entries) {
+				return Route{}, false
+			}
+			entry.routeGen = lookup.Generation
+		}
+		entry.lastUsed = coarseClock.Load()
+		return Route{
+			SrcInstanceIP: entry.srcInstanceIp,
+			DstIP:         entry.dstip,
+			DstNode:       entry.dstNode,
+			DstNodePort:   entry.dstNodePort,
+		}, true
 	}
-	return ConversionEntry{}, false
+	return Route{}, false
 }
 
-// MarkRouteCurrent records that a cached flow was revalidated against
-// translation table generation gen, so later packets on the same flow can skip
-// the scan while the table stays unchanged.
-func (cache *ProxyCache) MarkRouteCurrent(entry ConversionEntry, gen uint64) {
-	shard := shardOf(entry.srcport)
-	cache.locks[shard].Lock()
-	defer cache.locks[shard].Unlock()
-
-	bucket := &cache.cache[entry.srcport]
-	for i := range bucket.entries {
-		if bucket.entries[i].sameFlowAs(&entry) {
-			bucket.entries[i].routeGen = gen
-			return
-		}
-	}
+// Install records a freshly chosen route for key, tagged with the
+// translation table generation it was chosen from.
+func (cache *ProxyCache) Install(key FlowKey, r Route, dstInstanceIP netip.Addr, gen uint64) {
+	cache.Add(ConversionEntry{
+		srcip:         key.SrcIP,
+		dstip:         r.DstIP,
+		dstServiceIp:  key.DstServiceIP,
+		srcInstanceIp: key.SrcInstanceIP,
+		dstInstanceIp: dstInstanceIP,
+		srcport:       key.SrcPort,
+		dstport:       key.DstPort,
+		protocol:      key.Protocol,
+		dstNode:       r.DstNode,
+		dstNodePort:   r.DstNodePort,
+		routeGen:      gen,
+	})
 }
 
-// RetrieveByInstanceIp looks up the flow a reply belongs to, so it can be
+// Reverse resolves the flow a reply belongs to, so it can be
 // reverse-translated. The arguments are read off the reply packet: it is
 // addressed to the local namespace IP and local port the flow originated from,
 // and sourced from the remote instance IP and port it was sent to.
-func (cache *ProxyCache) RetrieveByInstanceIp(
-	protocol uint8, localNsIP netip.Addr, localPort int,
-	remoteIP netip.Addr, remotePort int,
-) (ConversionEntry, bool) {
+func (cache *ProxyCache) Reverse(protocol uint8, localNsIP netip.Addr, localPort int,
+	remoteIP netip.Addr, remotePort int) (ReverseRoute, bool) {
 	shard := shardOf(localPort)
 	cache.locks[shard].Lock()
 	defer cache.locks[shard].Unlock()
@@ -207,9 +245,9 @@ func (cache *ProxyCache) RetrieveByInstanceIp(
 			continue
 		}
 		entry.lastUsed = coarseClock.Load()
-		return *entry, true
+		return ReverseRoute{DstServiceIP: entry.dstServiceIp, SrcIP: entry.srcip}, true
 	}
-	return ConversionEntry{}, false
+	return ReverseRoute{}, false
 }
 
 // sameFlowAs compares the full forward identity of two entries. Anything less

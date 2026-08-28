@@ -6,16 +6,11 @@ import (
 	"sync"
 )
 
-// The proxy translates addresses, so a fragmented datagram cannot be handled
-// one fragment at a time: only the first fragment carries the transport ports
-// the flow lookup needs. Forwarding just that one - which is what happened
-// before - guarantees the datagram never reassembles at the far end.
-//
-// Rather than reassembling (which would mean buffering whole datagrams on the
-// packet path), the translation chosen for the first fragment is remembered
-// here and replayed onto the datagram's later fragments, which need only
-// their addresses rewritten. Fragments of one datagram arrive back to back, so
-// this state is short-lived by design.
+// Only the first fragment of a datagram carries the transport ports the flow
+// lookup needs, so later fragments can't be translated independently. Rather
+// than reassembling the whole datagram on the packet path, the first
+// fragment's translation is remembered here and replayed onto its later
+// fragments, which need only their addresses rewritten.
 const (
 	fragmentTTLSeconds = 5
 	maxFragmentEntries = 1024

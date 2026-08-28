@@ -85,11 +85,10 @@ func largePayload(n int) []byte {
 	return p
 }
 
-// TestOutgoingFragmentedDatagram is the behaviour that was broken: only the
-// first fragment of an oversized UDP datagram was ever forwarded, so the
-// datagram could never reassemble at the far end.
+// TestOutgoingFragmentedDatagram checks a later fragment replays the first
+// fragment's translation and reassembles correctly at the far end.
 func TestOutgoingFragmentedDatagram(t *testing.T) {
-	proxy := getFakeTunnel()
+	dp := getFakeDatapath()
 	wire := buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, largePayload(2000))
 	first, later := fragmentIPv4(t, wire, 1024)
 	laterPayloadBefore := append([]byte(nil), later[20:]...)
@@ -98,11 +97,11 @@ func TestOutgoingFragmentedDatagram(t *testing.T) {
 	if !firstPkt.IsFragment() || !firstPkt.IsFirstFragment() {
 		t.Fatal("first fragment misdetected")
 	}
-	node, port, _, ok := proxy.outgoingProxy(&firstPkt)
+	node, port, _, ok := dp.outgoingProxy(&firstPkt)
 	if !ok {
 		t.Fatal("first fragment should have been proxied")
 	}
-	proxy.proxycache.frags.remember(fragmentKey{
+	dp.proxycache.frags.remember(fragmentKey{
 		src: mustAddr(clientNsIP), dst: mustAddr(serverVIP),
 		id: firstPkt.FragmentID(), version: 4, proto: iputils.ProtoUDP,
 	}, fragmentTranslation{
@@ -124,7 +123,7 @@ func TestOutgoingFragmentedDatagram(t *testing.T) {
 		t.Fatal("isLaterFragment should recognise this")
 	}
 
-	translation, known := proxy.proxycache.frags.lookup(keyFor(&laterPkt))
+	translation, known := dp.proxycache.frags.lookup(keyFor(&laterPkt))
 	if !known {
 		t.Fatal("no fragment state recorded for the later fragment")
 	}
@@ -153,7 +152,7 @@ func TestOutgoingFragmentedDatagram(t *testing.T) {
 }
 
 func TestFragmentedDatagramIPv6(t *testing.T) {
-	proxy := getFakeTunnel()
+	dp := getFakeDatapath()
 	full := buildUDPv6(t, clientNsIPv6, serverVIPv6, 40000, 53, largePayload(2000))
 	first, later := fragmentIPv6(t, full, 1024, 0xdeadbeef)
 	laterPayloadBefore := append([]byte(nil), later[48:]...)
@@ -166,11 +165,11 @@ func TestFragmentedDatagramIPv6(t *testing.T) {
 		t.Errorf("fragment id = %#x; want 0xdeadbeef", firstPkt.FragmentID())
 	}
 	key := keyFor(&firstPkt)
-	node, port, _, ok := proxy.outgoingProxy(&firstPkt)
+	node, port, _, ok := dp.outgoingProxy(&firstPkt)
 	if !ok {
 		t.Fatal("first IPv6 fragment should have been proxied")
 	}
-	proxy.proxycache.frags.remember(key, fragmentTranslation{
+	dp.proxycache.frags.remember(key, fragmentTranslation{
 		newSrc: firstPkt.SrcIP(), newDst: firstPkt.DstIP(),
 		dstNode: node, dstNodePort: port,
 	})
@@ -182,7 +181,7 @@ func TestFragmentedDatagramIPv6(t *testing.T) {
 	if !isLaterFragment(&laterPkt) {
 		t.Fatal("later IPv6 fragment misdetected")
 	}
-	translation, known := proxy.proxycache.frags.lookup(keyFor(&laterPkt))
+	translation, known := dp.proxycache.frags.lookup(keyFor(&laterPkt))
 	if !known {
 		t.Fatal("no fragment state recorded for the later IPv6 fragment")
 	}
@@ -268,7 +267,7 @@ func TestFragmentCacheBounded(t *testing.T) {
 // seen here cannot be made consistent with its siblings, so it must not be
 // forwarded.
 func TestUnknownLaterFragmentDropped(t *testing.T) {
-	proxy := getFakeTunnel()
+	dp := getFakeDatapath()
 	wire := buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, largePayload(2000))
 	_, later := fragmentIPv4(t, wire, 1024)
 
@@ -277,25 +276,26 @@ func TestUnknownLaterFragmentDropped(t *testing.T) {
 		t.Fatal("later fragment failed to parse")
 	}
 	before := append([]byte(nil), pkt.Bytes()...)
-	proxy.forwardLaterFragment(&pkt)
+	if _, ok := dp.forwardLaterFragment(&pkt); ok {
+		t.Error("an unknown later fragment was reported as translated")
+	}
 	if !bytes.Equal(pkt.Bytes(), before) {
 		t.Error("an unknown later fragment was translated")
 	}
 }
 
 // TestHandleOutgoingForwardsWholeDatagram drives the complete outgoing path
-// over a real socket: every fragment of an oversized UDP datagram has to reach
-// the same node, consistently translated. Before fragment state was kept, only
-// the first one was ever forwarded.
+// over a real socket: every fragment of an oversized UDP datagram must reach
+// the same node, consistently translated.
 func TestHandleOutgoingForwardsWholeDatagram(t *testing.T) {
-	proxy, listener := loopbackTunnel(t)
+	tunnel, listener := loopbackTunnel(t)
 
 	wire := buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, largePayload(2000))
 	first, later := fragmentIPv4(t, wire, 1024)
 	laterPayloadBefore := append([]byte(nil), later[20:]...)
 
-	proxy.handleOutgoing(first, false)
-	proxy.handleOutgoing(later, false)
+	tunnel.Emit(tunnel.dp.Handle(Outgoing, first))
+	tunnel.Emit(tunnel.dp.Handle(Outgoing, later))
 
 	gotFirst := parseTestPacket(t, readForwarded(t, listener))
 	if gotFirst.SrcIP() != mustAddr(clientInstIP) || gotFirst.DstIP() != mustAddr(serverNsIP) {

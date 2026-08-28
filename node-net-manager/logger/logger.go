@@ -31,10 +31,9 @@ func SetDebugMode() {
 	debugMode = true
 }
 
-// IsDebug reports whether debug logging is enabled. Hot paths should guard
-// DebugLogger() calls with this: DebugLogger() only discards the *output*,
-// it still formats every argument (including allocating net.IP.String()
-// calls) and pays for the log.Logger mutex even when nothing is printed.
+// IsDebug reports whether debug logging is enabled. Guard DebugLogger() calls
+// on hot paths with this - DebugLogger() still formats its arguments and
+// takes the logger mutex even when the output is discarded.
 func IsDebug() bool {
 	return debugMode
 }

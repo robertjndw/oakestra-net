@@ -1,14 +1,12 @@
 // Package iputils provides a zero-copy, zero-allocation view over raw IPv4
-// and IPv6 datagrams for the proxy's NAT-style translation: swapping the
-// source and destination addresses in place and fixing up the affected
-// checksums incrementally (RFC 1624), instead of parsing the packet into
-// gopacket layer structs, rebuilding it in a fresh buffer, and re-parsing
-// the result - which is what this package used to do.
+// and IPv6 datagrams for the proxy's NAT-style translation: it swaps the
+// source and destination addresses in place and fixes up the affected
+// checksums incrementally (RFC 1624) instead of parsing into gopacket layer
+// structs, rebuilding in a fresh buffer, and re-parsing the result.
 //
-// Only the source/destination addresses are ever rewritten; ports and
-// payload are never touched, which is exactly the case RFC 1624's
-// incremental checksum update is for for: it recomputes the checksum from
-// the old/new header bytes alone, in O(1), without looking at the payload.
+// Only addresses are ever rewritten, never ports or payload - exactly the
+// case RFC 1624 covers: the checksum can be updated from the old/new header
+// bytes alone, in O(1), without touching the payload.
 package iputils
 
 import "net/netip"
@@ -195,7 +193,6 @@ func (p Packet) IsFirstFragment() bool { return p.l4Start >= 0 }
 // on address family, addresses and protocol as well.
 func (p Packet) FragmentID() uint32 { return p.fragID }
 
-// SrcIP returns the packet's source address.
 func (p Packet) SrcIP() netip.Addr {
 	if p.version == 4 {
 		return netip.AddrFrom4([4]byte(p.buf[12:16]))
@@ -203,7 +200,6 @@ func (p Packet) SrcIP() netip.Addr {
 	return netip.AddrFrom16([16]byte(p.buf[8:24]))
 }
 
-// DstIP returns the packet's destination address.
 func (p Packet) DstIP() netip.Addr {
 	if p.version == 4 {
 		return netip.AddrFrom4([4]byte(p.buf[16:20]))
