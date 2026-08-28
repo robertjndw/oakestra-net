@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"runtime"
@@ -23,15 +24,30 @@ import (
 
 const NamespaceAlreadyDeclared string = "namespace already declared"
 
+// ServiceLookup is the result of resolving a Service IP on the packet path.
+// Entries is empty on a miss, in which case Resolving is either a channel that
+// closes when the in-flight background resolution finishes - so the caller can
+// hold the packet and retry instead of losing it - or nil when no resolution
+// is running and the packet should just be dropped.
+//
+// Generation is the translation table generation Entries was read under. A
+// cached route tagged with the same generation is still current, so the caller
+// can skip revalidating it against every replica.
+type ServiceLookup struct {
+	Entries    []TableEntryCache.TableEntry
+	Generation uint64
+	Resolving  <-chan struct{}
+}
+
+// The packet-path lookups take netip.Addr rather than net.IP: the parser
+// produces netip.Addr straight off the wire, and converting back allocated on
+// every translated packet.
 type EnvironmentManager interface {
-	// GetTableEntryByServiceIP returns the entries for ip. On a miss it starts
-	// background resolution and returns a channel that is closed when that attempt
-	// completes, so the caller can hold the packet and retry instead of losing it;
-	// the channel is nil when no resolution is running and the packet should just
-	// be dropped. Resolution needs a blocking MQTT round trip and must never
-	// happen on the packet path - see resolveServiceIPOnce.
-	GetTableEntryByServiceIP(ip net.IP) ([]TableEntryCache.TableEntry, <-chan struct{})
-	GetTableEntryByNsIP(ip net.IP) (TableEntryCache.TableEntry, bool)
+	// GetTableEntryByServiceIP returns the entries for addr, starting
+	// background resolution on a miss. Resolution needs a blocking MQTT round
+	// trip and must never happen on the packet path - see resolveServiceIPOnce.
+	GetTableEntryByServiceIP(addr netip.Addr) ServiceLookup
+	GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool)
 	GetTableEntryByInstanceIP(ip net.IP) (TableEntryCache.TableEntry, bool)
 }
 
@@ -59,8 +75,8 @@ type Environment struct {
 	// resolveLock guards pendingResolves and failedServiceIPs. Both maps are
 	// created lazily so the zero Environment stays usable.
 	resolveLock      sync.Mutex
-	pendingResolves  map[string]chan struct{} // ServiceIP -> closed when its in-flight resolution finishes
-	failedServiceIPs map[string]time.Time     // ServiceIP -> when resolution last failed
+	pendingResolves  map[netip.Addr]chan struct{} // ServiceIP -> closed when its in-flight resolution finishes
+	failedServiceIPs map[netip.Addr]time.Time     // ServiceIP -> when resolution last failed
 	//### Deployment management variables
 	deployedServices     map[string]service // all the deployed services with the ip and ports
 	deployedServicesLock sync.RWMutex
@@ -74,6 +90,9 @@ type Environment struct {
 	clusterPort string
 	clusterAddr string
 	mtusize     int
+	// tableQuery performs the blocking table query. Nil selects the real MQTT
+	// round trip; tests substitute a stub for it.
+	tableQuery func(netip.Addr) ([]TableEntryCache.TableEntry, error)
 }
 
 type service struct {
@@ -499,13 +518,13 @@ const maxFailedServiceIPs = 1024
 // GetTableEntryByServiceIP Given a ServiceIP this method performs a search in the local ServiceCache
 // If the entry is not present, resolution is kicked off in the background and this call returns
 // the channel that signals its completion - see resolveServiceIPOnce for why this must not block.
-func (env *Environment) GetTableEntryByServiceIP(ip net.IP) ([]TableEntryCache.TableEntry, <-chan struct{}) {
+func (env *Environment) GetTableEntryByServiceIP(addr netip.Addr) ServiceLookup {
 	// If entry already available
-	table := env.translationTable.SearchByServiceIP(ip)
+	table, generation := env.translationTable.SearchByServiceIP(addr)
 	if len(table) > 0 {
 		// mark the job as just used, so its MQTT interest doesn't expire
 		table[0].Touch()
-		return table, nil
+		return ServiceLookup{Entries: table, Generation: generation}
 	}
 
 	// Miss: resolving requires a blocking MQTT round trip (up to ~5s, see
@@ -514,7 +533,7 @@ func (env *Environment) GetTableEntryByServiceIP(ip net.IP) ([]TableEntryCache.T
 	// node, not just this one. Drop this packet and resolve in the
 	// background instead; the caller can hang onto it and retry once the
 	// returned channel closes, or let a TCP retransmit go through.
-	return nil, env.resolveServiceIPOnce(ip)
+	return ServiceLookup{Resolving: env.resolveServiceIPOnce(addr)}
 }
 
 // resolveServiceIPOnce starts background resolution for ip and returns a
@@ -522,9 +541,7 @@ func (env *Environment) GetTableEntryByServiceIP(ip net.IP) ([]TableEntryCache.T
 // the packet that triggered it. Returns nil when no attempt is running: a
 // recent one already failed (see negativeResolveCacheTTL) or too many are
 // already in flight, in which case the caller should drop the packet.
-func (env *Environment) resolveServiceIPOnce(ip net.IP) <-chan struct{} {
-	key := ip.String()
-
+func (env *Environment) resolveServiceIPOnce(key netip.Addr) <-chan struct{} {
 	env.resolveLock.Lock()
 
 	if done, ok := env.pendingResolves[key]; ok {
@@ -545,14 +562,14 @@ func (env *Environment) resolveServiceIPOnce(ip net.IP) <-chan struct{} {
 	}
 
 	if env.pendingResolves == nil {
-		env.pendingResolves = make(map[string]chan struct{})
+		env.pendingResolves = make(map[netip.Addr]chan struct{})
 	}
 	done := make(chan struct{})
 	env.pendingResolves[key] = done
 	env.resolveLock.Unlock()
 
 	go func() {
-		err := env.resolveServiceIP(ip)
+		err := env.resolveServiceIP(key)
 
 		env.resolveLock.Lock()
 		delete(env.pendingResolves, key)
@@ -573,9 +590,9 @@ func (env *Environment) resolveServiceIPOnce(ip net.IP) <-chan struct{} {
 // entries and - if every entry is still fresh - dropping the map wholesale
 // rather than letting it grow. Worst case that costs a handful of ServiceIPs
 // one extra query each.
-func (env *Environment) rememberFailureLocked(key string) {
+func (env *Environment) rememberFailureLocked(key netip.Addr) {
 	if env.failedServiceIPs == nil {
-		env.failedServiceIPs = make(map[string]time.Time)
+		env.failedServiceIPs = make(map[netip.Addr]time.Time)
 	}
 
 	if len(env.failedServiceIPs) >= maxFailedServiceIPs {
@@ -586,7 +603,7 @@ func (env *Environment) rememberFailureLocked(key string) {
 			}
 		}
 		if len(env.failedServiceIPs) >= maxFailedServiceIPs {
-			env.failedServiceIPs = make(map[string]time.Time)
+			env.failedServiceIPs = make(map[netip.Addr]time.Time)
 		}
 	}
 
@@ -595,27 +612,84 @@ func (env *Environment) rememberFailureLocked(key string) {
 
 // resolveServiceIP performs the actual (blocking) table query and populates
 // the translation table. Must only ever run off the packet path.
-func (env *Environment) resolveServiceIP(ip net.IP) error {
-	entryList, err := tableQueryByIP(ip)
+//
+// Every path that leaves addr unresolved has to report an error, not just log
+// one: resolveServiceIPOnce reads the return value to decide whether to arm
+// the negative cache, so returning nil after a failed install would clear it
+// and let the very next packet start another MQTT round trip.
+func (env *Environment) resolveServiceIP(addr netip.Addr) error {
+	entryList, err := env.queryTable(addr)
 	if err != nil {
 		return err
 	}
-
-	var once sync.Once
-	for _, tableEntry := range entryList {
-		once.Do(func() { mqtt.MqttRegisterInterest(tableEntry.JobName, env) })
-		env.AddTableQueryEntry(tableEntry)
+	if len(entryList) < 1 {
+		return fmt.Errorf("table query for %s returned no instances", addr)
 	}
+
+	// Everything below has to be checked before the table is touched.
+	// ReplaceJobEntries deliberately displaces whatever holds the namespace
+	// IPs the new entries claim, so installing a response and only then
+	// deciding to reject it would take a working route down with it.
+	//
+	// A table query answers for exactly one job (see responseParser), so the
+	// whole instance list can be installed as one atomic replacement instead
+	// of entry by entry - each of which would rebuild the table indexes.
+	jobName := entryList[0].JobName
+	for i := range entryList {
+		if entryList[i].JobName != jobName {
+			return fmt.Errorf("table query for %s returned entries for both %s and %s",
+				addr, jobName, entryList[i].JobName)
+		}
+	}
+
+	// A response can be well-formed and still not answer the question that was
+	// asked: it resolves a job, not necessarily this address.
+	if !resolvesServiceIP(entryList, addr) {
+		return fmt.Errorf("table query for %s resolved job %s but not that address", addr, jobName)
+	}
+
+	if err := env.translationTable.ReplaceJobEntries(jobName, entryList); err != nil {
+		return err
+	}
+
+	mqtt.MqttRegisterInterest(jobName, env)
 	// register interest for sip as well to avoid querying the address too many times
-	mqtt.MqttRegisterInterest(ip.String(), env)
+	mqtt.MqttRegisterInterest(addr.String(), env)
 	return nil
+}
+
+// resolvesServiceIP reports whether any entry actually advertises addr as one
+// of its Service IPs.
+func resolvesServiceIP(entries []TableEntryCache.TableEntry, addr netip.Addr) bool {
+	for i := range entries {
+		for _, sip := range entries[i].ServiceIP {
+			if a, ok := TableEntryCache.AddrFromIP(sip.Address); ok && a == addr {
+				return true
+			}
+			if a, ok := TableEntryCache.AddrFromIP(sip.Address_v6); ok && a == addr {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (env *Environment) queryTable(addr netip.Addr) ([]TableEntryCache.TableEntry, error) {
+	if env.tableQuery != nil {
+		return env.tableQuery(addr)
+	}
+	return tableQueryByIP(addr)
 }
 
 // GetTableEntryByInstanceIP Given a ServiceIP this method performs a search in the local ServiceCache
 // If the entry is not present a TableQuery is performed and the interest registered
 func (env *Environment) GetTableEntryByInstanceIP(ip net.IP) (TableEntryCache.TableEntry, bool) {
+	addr, ok := TableEntryCache.AddrFromIP(ip)
+	if !ok {
+		return TableEntryCache.TableEntry{}, false
+	}
 	// If entry already available
-	table := env.translationTable.SearchByServiceIP(ip)
+	table, _ := env.translationTable.SearchByServiceIP(addr)
 	if len(table) > 0 {
 		for elemindex, elem := range table {
 			for _, elemIp := range elem.ServiceIP {
@@ -631,33 +705,21 @@ func (env *Environment) GetTableEntryByInstanceIP(ip net.IP) (TableEntryCache.Ta
 
 // GetTableEntryByNsIP Given a NamespaceIP finds the table entry. This search is local because the networking component MUST have all
 // the entries for the local deployed services.
-func (env *Environment) GetTableEntryByNsIP(ip net.IP) (TableEntryCache.TableEntry, bool) {
-	// If entry already available
-	entry, exist := env.translationTable.SearchByNsIP(ip)
-	if exist {
-		return entry, true
-	}
-	return entry, false
-}
-
-// AddTableQueryEntry Add new entry to the resolution table
-func (env *Environment) AddTableQueryEntry(entry TableEntryCache.TableEntry) {
-	_ = env.translationTable.RemoveByNsip(entry.Nsip)
-	err := env.translationTable.Add(entry)
-	if err != nil {
-		logger.ErrorLogger().Println(err)
-	}
+func (env *Environment) GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool) {
+	return env.translationTable.SearchByNsIP(addr)
 }
 
 // RefreshServiceTable force a table query refresh for a service
 func (env *Environment) RefreshServiceTable(jobname string) {
 	logger.DebugLogger().Printf("Requested table query refresh for %s", jobname)
 	entryList, err := tableQueryByJobName(jobname, true)
-	if err == nil {
-		_ = env.translationTable.RemoveByJobName(jobname)
-		for _, tableEntry := range entryList {
-			env.AddTableQueryEntry(tableEntry)
-		}
+	if err != nil {
+		return
+	}
+	// One replacement, one index rebuild - readers see either the whole old
+	// set or the whole new one, never a table mid-refresh.
+	if err := env.translationTable.ReplaceJobEntries(jobname, entryList); err != nil {
+		logger.ErrorLogger().Println(err)
 	}
 }
 

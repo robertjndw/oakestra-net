@@ -37,6 +37,8 @@ type Packet struct {
 	protocol uint8 // IPv4 protocol field / IPv6 next-header of the L4 payload
 	ipLen    int   // IP header length in bytes (v4: IHL*4; v6: 40 + extension headers)
 	l4Start  int   // offset of the L4 (TCP/UDP) header; -1 if none is present here
+	fragment bool  // this datagram was fragmented (v4: MF or non-zero offset; v6: a fragment header)
+	fragID   uint32
 }
 
 // Parse decodes buf just far enough to translate it: IP version, header
@@ -74,10 +76,16 @@ func parseIPv4(buf []byte) (Packet, bool) {
 		ipLen:    ihl,
 		l4Start:  -1,
 	}
-	// Fragment Offset is the low 13 bits of the flags+offset field. Only the
-	// first fragment (offset 0) carries an L4 header - later fragments are
-	// raw payload continuation and must not be parsed as one.
-	fragOffset := readUint16(buf[6:8]) & 0x1fff
+	// Fragment Offset is the low 13 bits of the flags+offset field, and MF
+	// (More Fragments) is bit 0x2000. Only the first fragment (offset 0)
+	// carries an L4 header - later fragments are raw payload continuation and
+	// must not be parsed as one.
+	flagsAndOffset := readUint16(buf[6:8])
+	fragOffset := flagsAndOffset & 0x1fff
+	p.fragment = fragOffset != 0 || flagsAndOffset&0x2000 != 0
+	if p.fragment {
+		p.fragID = uint32(readUint16(buf[4:6]))
+	}
 	if fragOffset == 0 {
 		p.l4Start = ihl
 	}
@@ -93,6 +101,7 @@ func parseIPv6(buf []byte) (Packet, bool) {
 	offset := ipv6HeaderLen
 	isFragment := false
 	firstFragment := true
+	var fragID uint32
 
 	// Walk the extension header chain to find the L4 header. Bounded so a
 	// malformed or adversarial chain can't spin forever.
@@ -122,8 +131,10 @@ walk:
 				return Packet{}, false
 			}
 			isFragment = true
-			// Fragment Offset is the top 13 bits of bytes offset+2:offset+4.
+			// Fragment Offset is the top 13 bits of bytes offset+2:offset+4,
+			// and the Identification is the 32-bit field at offset+4.
 			firstFragment = readUint16(buf[offset+2:offset+4])>>3 == 0
+			fragID = readUint32(buf[offset+4 : offset+8])
 			nextHeader, offset = buf[offset], offset+8
 		default:
 			break walk
@@ -136,6 +147,8 @@ walk:
 		protocol: nextHeader,
 		ipLen:    offset,
 		l4Start:  -1,
+		fragment: isFragment,
+		fragID:   fragID,
 	}
 	if !isFragment || firstFragment {
 		p.l4Start = offset
@@ -166,6 +179,21 @@ func (p Packet) HasTransport() bool {
 		return false
 	}
 }
+
+// IsFragment reports whether this packet is one fragment of a larger
+// datagram - including the first one, which is indistinguishable from an
+// unfragmented packet by its L4 header alone.
+func (p Packet) IsFragment() bool { return p.fragment }
+
+// IsFirstFragment reports whether this fragment carries the datagram's
+// transport header. Meaningful only when IsFragment is true.
+func (p Packet) IsFirstFragment() bool { return p.l4Start >= 0 }
+
+// FragmentID returns the datagram identification shared by every fragment of
+// one datagram (16 bits for IPv4, 32 for IPv6). Meaningful only when
+// IsFragment is true. It is not unique on its own: fragments must be matched
+// on address family, addresses and protocol as well.
+func (p Packet) FragmentID() uint32 { return p.fragID }
 
 // SrcIP returns the packet's source address.
 func (p Packet) SrcIP() netip.Addr {

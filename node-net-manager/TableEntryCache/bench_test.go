@@ -3,6 +3,7 @@ package TableEntryCache
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"testing"
 )
 
@@ -40,11 +41,11 @@ func BenchmarkSearchByServiceIP(b *testing.B) {
 		b.Run(fmt.Sprintf("entries=%d", n), func(b *testing.B) {
 			table := populatedTable(n)
 			// look up the last entry inserted - worst case for a linear scan
-			target := net.ParseIP(fmt.Sprintf("10.30.%d.%d", (n-1)/250, (n-1)%250))
+			target := netip.MustParseAddr(fmt.Sprintf("10.30.%d.%d", (n-1)/250, (n-1)%250))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if res := table.SearchByServiceIP(target); len(res) != 1 {
+				if res, _ := table.SearchByServiceIP(target); len(res) != 1 {
 					b.Fatalf("expected 1 match, got %d", len(res))
 				}
 			}
@@ -56,7 +57,7 @@ func BenchmarkSearchByNsIP(b *testing.B) {
 	for _, n := range []int{10, 100, 500} {
 		b.Run(fmt.Sprintf("entries=%d", n), func(b *testing.B) {
 			table := populatedTable(n)
-			target := net.ParseIP(fmt.Sprintf("10.19.%d.%d", (n-1)/250, (n-1)%250+1))
+			target := netip.MustParseAddr(fmt.Sprintf("10.19.%d.%d", (n-1)/250, (n-1)%250+1))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {

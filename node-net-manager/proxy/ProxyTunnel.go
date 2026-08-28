@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/songgao/water"
 )
@@ -27,6 +28,14 @@ const packetReadBufferSize = 64 * 1024
 // busy translating the previous one.
 const socketBufferSize = 4 * 1024 * 1024
 
+// Idle tunnel sockets are closed rather than kept for the process lifetime:
+// every distinct peer node ever talked to would otherwise hold a descriptor
+// and a socket buffer allocation forever.
+const (
+	connectionIdleTimeout   = 5 * time.Minute
+	connectionSweepInterval = time.Minute
+)
+
 // Config
 type Configuration struct {
 	HostTUNDeviceName         string `json:"HostTunnelDeviceName"`
@@ -40,28 +49,42 @@ type Configuration struct {
 	ProxySubnetworkIPv6Prefix int    `json:"ProxySubnetworkIPv6Prefix"`
 }
 
+// tunnelConn is one UDP socket to a peer node, plus the coarse timestamp the
+// idle sweeper uses to decide when to close it.
+type tunnelConn struct {
+	conn     *net.UDPConn
+	lastUsed atomic.Int64
+}
+
 type GoProxyTunnel struct {
-	environment         env.EnvironmentManager
-	listenConnection    *net.UDPConn
-	connectionBuffer    map[netip.AddrPort]*net.UDPConn
-	ifce                *water.Interface
-	finishChannel       chan bool
-	errorChannel        chan error
-	stopChannel         chan bool
-	HostTUNDeviceName   string
-	tunNetIPv6          string
-	tunNetIP            string
-	mtusize             string
-	ProxyIpSubnetwork   net.IPNet
-	ProxyIPv6Subnetwork net.IPNet
-	localIP             net.IP
-	proxycache          *ProxyCache
-	TunnelPort          int
+	environment       env.EnvironmentManager
+	listenConnection  *net.UDPConn
+	connectionBuffer  map[netip.AddrPort]*tunnelConn
+	ifce              *water.Interface
+	finishChannel     chan bool
+	errorChannel      chan error
+	stopChannel       chan bool
+	HostTUNDeviceName string
+	tunNetIPv6        string
+	tunNetIP          string
+	mtusize           string
+	// The proxy subnetworks are netip.Prefix rather than net.IPNet so the
+	// per-packet containment check needs no conversion of the parsed address.
+	ProxyIPv4Prefix netip.Prefix
+	ProxyIPv6Prefix netip.Prefix
+	localIP         netip.Addr
+	proxycache      *ProxyCache
+	TunnelPort      int
 	// connectionBufferLock guards only connectionBuffer. net.UDPConn is
 	// itself safe for concurrent use, so nothing else needs to hold this
 	// while a packet is actually being written.
 	connectionBufferLock sync.RWMutex
-	isListening          bool
+	// replayLock guards replays and replayBytes. Both are only touched on a
+	// cold miss, never on the steady-state packet path.
+	replayLock  sync.Mutex
+	replays     map[netip.Addr]*pendingReplay
+	replayBytes int
+	isListening bool
 }
 
 // packetBufPool holds MTU-sized buffers for reading packets off the TUN
@@ -92,53 +115,220 @@ func putPacketBuf(b *[]byte) {
 // yields no matching table entry would re-enter and replay forever.
 func (proxy *GoProxyTunnel) handleOutgoing(buf []byte, mayRetain bool) {
 	pkt, ok := iputils.Parse(buf)
-	if !ok || !pkt.HasTransport() {
+	if !ok {
 		return
 	}
 	if logger.IsDebug() {
 		logger.DebugLogger().Printf("Outgoing packet:\t\t\t%s ---> %s\n", pkt.SrcIP(), pkt.DstIP())
 	}
 
+	// A later fragment has no transport header to resolve a flow with, only
+	// the translation its first fragment already established. If that first
+	// fragment is itself still queued waiting for the route, this one has to
+	// wait behind it rather than be dropped - otherwise the datagram loses
+	// every fragment but the first and can never reassemble.
+	if isLaterFragment(&pkt) {
+		if !proxy.forwardLaterFragment(&pkt) && mayRetain {
+			proxy.retainFragmentForReplay(buf, pkt.DstIP())
+		}
+		return
+	}
+	if !pkt.HasTransport() {
+		return
+	}
+
+	// The fragment key has to be taken before outgoingProxy rewrites the
+	// addresses, so it matches the later fragments, which arrive untranslated.
+	var fragKey fragmentKey
+	firstFragment := pkt.IsFragment()
+	if firstFragment {
+		fragKey = keyFor(&pkt)
+	}
+
 	dstHost, dstPort, resolving, ok := proxy.outgoingProxy(&pkt)
 	if !ok {
 		if mayRetain && resolving != nil {
-			proxy.retainForReplay(buf, resolving)
+			proxy.retainForReplay(buf, pkt.DstIP(), resolving)
 		}
 		return
+	}
+
+	if firstFragment {
+		proxy.proxycache.frags.remember(fragKey, fragmentTranslation{
+			newSrc:      pkt.SrcIP(),
+			newDst:      pkt.DstIP(),
+			dstNode:     dstHost,
+			dstNodePort: dstPort,
+		})
 	}
 	proxy.forward(dstHost, dstPort, pkt.Bytes(), 0)
 }
 
-// maxPendingReplayPackets bounds how many packets may be held at once waiting
-// for their destination ServiceIP to resolve.
-const maxPendingReplayPackets = 256
+// forwardLaterFragment translates a non-first fragment using the state its
+// first fragment left behind and sends it to the same node. Only the
+// addresses (and, for IPv4, the header checksum) are rewritten - there is no
+// transport header here to checksum, and Rewrite already knows not to look
+// for one. Reports false when there is no such state, so the caller can
+// decide whether the fragment is worth holding onto.
+func (proxy *GoProxyTunnel) forwardLaterFragment(pkt *iputils.Packet) bool {
+	translation, ok := proxy.proxycache.frags.lookup(keyFor(pkt))
+	if !ok {
+		return false
+	}
+	if !pkt.Rewrite(translation.newSrc, translation.newDst) {
+		return false
+	}
+	proxy.forward(translation.dstNode, translation.dstNodePort, pkt.Bytes(), 0)
+	return true
+}
 
-var pendingReplayCount atomic.Int32
+// isLaterFragment reports whether pkt is a fragment carrying no transport
+// header. Non-TCP/UDP protocols are excluded: this proxy only ever translates
+// those two, so fragment state is never kept for anything else.
+func isLaterFragment(pkt *iputils.Packet) bool {
+	if !pkt.IsFragment() || pkt.IsFirstFragment() {
+		return false
+	}
+	return pkt.Protocol() == iputils.ProtoTCP || pkt.Protocol() == iputils.ProtoUDP
+}
+
+// maxReplayPacketsPerVIP bounds how many packets may queue behind one
+// unresolved Service IP, and maxReplayBytes bounds the total across all of
+// them. The old scheme kept a 64KiB pooled buffer per retained packet, so a
+// full queue pinned 16MiB to hold packets of around the 1450-byte MTU.
+const (
+	maxReplayPacketsPerVIP = 32
+	maxReplayBytes         = 1 << 20
+)
+
+// pendingReplay is the FIFO of packets waiting on one Service IP's resolution.
+// Guarded by GoProxyTunnel.replayLock.
+type pendingReplay struct {
+	packets [][]byte
+	bytes   int
+}
 
 // retainForReplay holds a copy of a packet whose ServiceIP is still being
 // resolved and re-runs it once resolution finishes. Resolution can't happen on
 // the packet path, so without this the first packet of every cold flow is
 // lost: harmless for TCP, which retransmits, but it silently drops a one-shot
 // UDP datagram whose only fault was arriving before its route.
-func (proxy *GoProxyTunnel) retainForReplay(buf []byte, resolving <-chan struct{}) {
-	if pendingReplayCount.Add(1) > maxPendingReplayPackets {
-		pendingReplayCount.Add(-1)
+//
+// Packets queue per Service IP and replay in arrival order. Giving each
+// retained packet its own goroutine instead - all of them blocked on the same
+// resolution channel - hands the order they resume in to the scheduler, which
+// reorders datagrams an application submitted in sequence.
+func (proxy *GoProxyTunnel) retainForReplay(buf []byte, vip netip.Addr, resolving <-chan struct{}) {
+	proxy.replayLock.Lock()
+
+	if queue, waiting := proxy.replays[vip]; waiting {
+		proxy.enqueueReplayLocked(queue, buf)
+		proxy.replayLock.Unlock()
 		return
 	}
 
-	// buf belongs to outgoingLoop's pool and is reused as soon as
-	// handleOutgoing returns, so it must be copied before we hang onto it
-	// past this call.
-	cp := getPacketBuf()
-	*cp = (*cp)[:len(buf)]
-	copy(*cp, buf)
+	queue := &pendingReplay{}
+	if !proxy.enqueueReplayLocked(queue, buf) {
+		proxy.replayLock.Unlock()
+		return
+	}
+	if proxy.replays == nil {
+		proxy.replays = make(map[netip.Addr]*pendingReplay)
+	}
+	proxy.replays[vip] = queue
+	proxy.replayLock.Unlock()
 
-	go func() {
-		defer pendingReplayCount.Add(-1)
-		defer putPacketBuf(cp)
-		<-resolving
-		proxy.handleOutgoing(*cp, false)
-	}()
+	// Exactly one waiter per Service IP, started when its queue is created.
+	go proxy.replayWhenResolved(vip, resolving)
+}
+
+// retainFragmentForReplay queues a later fragment behind the first fragment of
+// its own datagram, which is already waiting for this Service IP to resolve.
+// A later fragment is still addressed to the untranslated Service IP, so it
+// keys into the same queue, and replay is FIFO - the first fragment installs
+// the translation before these reach forwardLaterFragment again.
+//
+// It only ever appends to a queue that already exists. A later fragment
+// carries no transport ports, so it cannot drive a resolution of its own, and
+// with nothing already waiting there is no first fragment for it to stay
+// consistent with - buffering it speculatively would mean holding
+// attacker-controllable bytes for a first fragment that may never come.
+//
+// That is not a gap in normal operation: outgoingLoop is the only reader of
+// the TUN device and processes packets one at a time, so the local kernel's
+// own fragments reach handleOutgoing in the order it emitted them. The one
+// interleaving that does occur is with a replay in progress, and
+// replayWhenResolved keeps its queue published for exactly that reason.
+func (proxy *GoProxyTunnel) retainFragmentForReplay(buf []byte, vip netip.Addr) {
+	proxy.replayLock.Lock()
+	defer proxy.replayLock.Unlock()
+
+	if queue, waiting := proxy.replays[vip]; waiting {
+		proxy.enqueueReplayLocked(queue, buf)
+	}
+}
+
+// enqueueReplayLocked copies buf onto queue unless the per-Service-IP packet
+// cap or the global byte budget is already reached. buf belongs to
+// outgoingLoop's pool and is reused as soon as handleOutgoing returns, so it
+// must be copied before being held past that call; the copy is sized to the
+// packet, not to the pool's buffer.
+//
+// Drop-newest: a full queue means the application is already ahead of
+// resolution, and evicting the head would reorder what does get through.
+// Caller must hold replayLock.
+func (proxy *GoProxyTunnel) enqueueReplayLocked(queue *pendingReplay, buf []byte) bool {
+	if len(queue.packets) >= maxReplayPacketsPerVIP {
+		return false
+	}
+	if proxy.replayBytes+len(buf) > maxReplayBytes {
+		return false
+	}
+	queue.packets = append(queue.packets, append([]byte(nil), buf...))
+	queue.bytes += len(buf)
+	proxy.replayBytes += len(buf)
+	return true
+}
+
+// replayWhenResolved waits for one Service IP's resolution attempt to finish
+// and then re-runs everything queued behind it, in order. A failed attempt
+// needs no special case: the replays miss the table again and are dropped,
+// because they are not allowed to re-queue themselves.
+func (proxy *GoProxyTunnel) replayWhenResolved(vip netip.Addr, resolving <-chan struct{}) {
+	<-resolving
+
+	// Drain in rounds, leaving the queue published until it is actually
+	// empty. outgoingLoop keeps reading the TUN while this runs, so a later
+	// fragment of a datagram being replayed right now can still arrive; if the
+	// queue were detached up front it would find neither a queue to join nor
+	// the translation state its first fragment is about to install, and be
+	// dropped microseconds before it would have worked.
+	//
+	// This terminates: once resolution has finished, handleOutgoing only
+	// retains a packet while GetTableEntryByServiceIP reports a resolution
+	// still in flight. After success the route is in the table, and after
+	// failure the negative cache is armed before this channel closes - so
+	// nothing new joins the queue and the next round finds it empty.
+	for {
+		proxy.replayLock.Lock()
+		queue := proxy.replays[vip]
+		if queue == nil || len(queue.packets) == 0 {
+			delete(proxy.replays, vip)
+			if queue != nil {
+				proxy.replayBytes -= queue.bytes
+			}
+			proxy.replayLock.Unlock()
+			return
+		}
+		packets := queue.packets
+		proxy.replayBytes -= queue.bytes
+		queue.packets, queue.bytes = nil, 0
+		proxy.replayLock.Unlock()
+
+		for _, packet := range packets {
+			proxy.handleOutgoing(packet, false)
+		}
+	}
 }
 
 // handleIngoing processes one packet received on the tunnel UDP socket (or
@@ -147,16 +337,49 @@ func (proxy *GoProxyTunnel) retainForReplay(buf []byte, resolving <-chan struct{
 // the duration of this call.
 func (proxy *GoProxyTunnel) handleIngoing(buf []byte) {
 	pkt, ok := iputils.Parse(buf)
-	if !ok || !pkt.HasTransport() {
+	if !ok {
 		return
 	}
 	if logger.IsDebug() {
 		logger.DebugLogger().Printf("Ingoing packet:\t\t\t %s <--- %s\n", pkt.DstIP(), pkt.SrcIP())
 	}
 
-	// ingoingProxy returning false just means there's no reverse mapping for
-	// this flow - the packet is still forwarded to the TUN device unchanged.
-	proxy.ingoingProxy(&pkt)
+	if isLaterFragment(&pkt) {
+		// Unlike the outgoing direction, an unknown fragment is still written
+		// to the TUN device: an ingoing packet with no reverse mapping is
+		// forwarded unchanged here, and a fragment is no different. That is
+		// the common case on this path - ingoingProxy only matches flows this
+		// node originated, so every inbound *request* is unmatched.
+		//
+		// Known limitation: if the two tunnel datagrams reorder and a later
+		// fragment arrives before a first fragment that does get
+		// reverse-translated, the two are written with different sources and
+		// the datagram will not reassemble. Holding unknown later fragments
+		// to cover that would penalise the far more common pass-through case.
+		if translation, known := proxy.proxycache.frags.lookup(keyFor(&pkt)); known {
+			pkt.Rewrite(translation.newSrc, translation.newDst)
+		}
+	} else {
+		if !pkt.HasTransport() {
+			return
+		}
+
+		var fragKey fragmentKey
+		firstFragment := pkt.IsFragment()
+		if firstFragment {
+			fragKey = keyFor(&pkt)
+		}
+
+		// ingoingProxy returning false just means there's no reverse mapping
+		// for this flow - the packet is still forwarded to the TUN device
+		// unchanged.
+		if proxy.ingoingProxy(&pkt) && firstFragment {
+			proxy.proxycache.frags.remember(fragKey, fragmentTranslation{
+				newSrc: pkt.SrcIP(),
+				newDst: pkt.DstIP(),
+			})
+		}
+	}
 
 	if _, err := proxy.ifce.Write(pkt.Bytes()); err != nil {
 		logger.ErrorLogger().Println(err)
@@ -171,45 +394,55 @@ func (proxy *GoProxyTunnel) handleIngoing(buf []byte) {
 // non-nil only when the ServiceIP is still being resolved in the background
 // (a cold miss), so the caller can hold onto the packet and retry once it
 // closes instead of losing it outright.
-func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, dstPort int, resolving <-chan struct{}, ok bool) {
+func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPort int, resolving <-chan struct{}, ok bool) {
 	dstIP := pkt.DstIP()
 	srcIP := pkt.SrcIP()
+	protocol := pkt.Protocol()
 	srcport := int(pkt.SrcPort())
 	dstport := int(pkt.DstPort())
 
-	dstIPNet := netIPFromAddr(dstIP)
 	var inProxySubnet bool
 	if pkt.Version() == 4 {
-		inProxySubnet = proxy.ProxyIpSubnetwork.Contains(dstIPNet)
+		inProxySubnet = proxy.ProxyIPv4Prefix.Contains(dstIP)
 	} else {
-		inProxySubnet = proxy.ProxyIPv6Subnetwork.Contains(dstIPNet)
+		inProxySubnet = proxy.ProxyIPv6Prefix.Contains(dstIP)
 	}
 	if !inProxySubnet {
-		return nil, 0, nil, false
+		return netip.Addr{}, 0, nil, false
 	}
 
 	// Check if the ServiceIP is known
-	tableEntryList, resolveCh := proxy.environment.GetTableEntryByServiceIP(dstIPNet)
-	if len(tableEntryList) < 1 {
-		return nil, 0, resolveCh, false
+	lookup := proxy.environment.GetTableEntryByServiceIP(dstIP)
+	if len(lookup.Entries) < 1 {
+		return netip.Addr{}, 0, lookup.Resolving, false
 	}
 
 	// Find the instanceIP of the current service
 	instanceIP, ok := proxy.convertToInstanceIp(pkt.Version(), srcIP)
 	if !ok {
-		return nil, 0, nil, false
+		return netip.Addr{}, 0, nil, false
 	}
 
 	// Check proxy proxycache (if any active flow is there already)
-	entry, exist := proxy.proxycache.RetrieveByServiceIP(srcIP, instanceIP, srcport, dstIP, dstport)
+	entry, exist := proxy.proxycache.RetrieveByServiceIP(protocol, srcIP, instanceIP, srcport, dstIP, dstport)
+	usable := exist && entry.dstport >= 1
+	if usable && entry.routeGen != lookup.Generation {
+		// The table changed since this route was picked, so it has to be
+		// checked against the current replica set once. While the generation
+		// matches, that scan is skipped entirely.
+		usable = TableEntryCache.IsRouteStillValid(entry.dstip, entry.dstNode, entry.dstNodePort, lookup.Entries)
+		if usable {
+			proxy.proxycache.MarkRouteCurrent(entry, lookup.Generation)
+		}
+	}
 
-	if !exist || entry.dstport < 1 || !TableEntryCache.IsRouteStillValid(entry.dstip, entry.dstNode, entry.dstNodePort, tableEntryList) {
+	if !usable {
 		// Choose between the table entry according to the ServiceIP algorithm
 		// TODO: so far this only uses RR, ServiceIP policies should be implemented here
 		// rand.IntN (math/rand/v2) is safe to call concurrently and seeded
 		// per-process, unlike a shared *rand.Rand - needed now that replay
 		// goroutines (see retainForReplay) can call in here too.
-		tableEntry := tableEntryList[rand.IntN(len(tableEntryList))]
+		tableEntry := lookup.Entries[rand.IntN(len(lookup.Entries))]
 
 		entryDstIPnet := tableEntry.Nsip
 		if pkt.Version() == 6 {
@@ -217,11 +450,11 @@ func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, 
 		}
 		entryDstIP, ok := TableEntryCache.AddrFromIP(entryDstIPnet)
 		if !ok {
-			return nil, 0, nil, false
+			return netip.Addr{}, 0, nil, false
 		}
 		nodeAddr, ok := TableEntryCache.AddrFromIP(tableEntry.Nodeip)
 		if !ok {
-			return nil, 0, nil, false
+			return netip.Addr{}, 0, nil, false
 		}
 
 		// Update proxycache. dstNode/dstNodePort are cached here too - an
@@ -233,29 +466,28 @@ func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, 
 			dstip:         entryDstIP,
 			dstServiceIp:  dstIP,
 			srcInstanceIp: instanceIP,
+			dstInstanceIp: instanceAddrOf(&tableEntry, pkt.Version()),
 			srcport:       srcport,
 			dstport:       dstport,
+			protocol:      protocol,
 			dstNode:       nodeAddr,
 			dstNodePort:   tableEntry.Nodeport,
+			routeGen:      lookup.Generation,
 		}
 		proxy.proxycache.Add(entry)
 	}
 
 	if !pkt.Rewrite(entry.srcInstanceIp, entry.dstip) {
-		return nil, 0, nil, false
+		return netip.Addr{}, 0, nil, false
 	}
-	return netIPFromAddr(entry.dstNode), entry.dstNodePort, nil, true
+	return entry.dstNode, entry.dstNodePort, nil, true
 }
 
-// convertToInstanceIp resolves the stable "instance IP" that identifies
-// srcIP's own service instance, for use as the translated source address.
-func (proxy *GoProxyTunnel) convertToInstanceIp(version uint8, srcIP netip.Addr) (netip.Addr, bool) {
-	instanceTableEntry, instanceexist := proxy.environment.GetTableEntryByNsIP(netIPFromAddr(srcIP))
-	if !instanceexist {
-		logger.ErrorLogger().Println("Unable to find instance IP for service: ", srcIP)
-		return netip.Addr{}, false
-	}
-	for _, sip := range instanceTableEntry.ServiceIP {
+// instanceAddrOf returns the "instance IP" that uniquely identifies one
+// deployed instance of a service, in the requested address family. It is the
+// address that instance's own proxy will source its replies from.
+func instanceAddrOf(entry *TableEntryCache.TableEntry, version uint8) netip.Addr {
+	for _, sip := range entry.ServiceIP {
 		if sip.IpType != TableEntryCache.InstanceNumber {
 			continue
 		}
@@ -263,9 +495,22 @@ func (proxy *GoProxyTunnel) convertToInstanceIp(version uint8, srcIP netip.Addr)
 		if version == 6 {
 			instanceIPnet = sip.Address_v6
 		}
-		return TableEntryCache.AddrFromIP(instanceIPnet)
+		addr, _ := TableEntryCache.AddrFromIP(instanceIPnet)
+		return addr
 	}
-	return netip.Addr{}, false
+	return netip.Addr{}
+}
+
+// convertToInstanceIp resolves the stable "instance IP" that identifies
+// srcIP's own service instance, for use as the translated source address.
+func (proxy *GoProxyTunnel) convertToInstanceIp(version uint8, srcIP netip.Addr) (netip.Addr, bool) {
+	instanceTableEntry, instanceexist := proxy.environment.GetTableEntryByNsIP(srcIP)
+	if !instanceexist {
+		logger.ErrorLogger().Println("Unable to find instance IP for service: ", srcIP)
+		return netip.Addr{}, false
+	}
+	addr := instanceAddrOf(&instanceTableEntry, version)
+	return addr, addr.IsValid()
 }
 
 // ingoingProxy checks the ProxyCache for a reverse mapping (a flow this node
@@ -273,12 +518,10 @@ func (proxy *GoProxyTunnel) convertToInstanceIp(version uint8, srcIP netip.Addr)
 // back to its original semantic addressing. Returns false (no-op) if there
 // is no such mapping - the packet is then forwarded unchanged.
 func (proxy *GoProxyTunnel) ingoingProxy(pkt *iputils.Packet) bool {
-	dstport := int(pkt.DstPort())
-	srcport := int(pkt.SrcPort())
-
-	// Check proxy proxycache for REVERSE entry conversion
-	// DstIP -> srcip, DstPort->srcport, srcport -> dstport
-	entry, exist := proxy.proxycache.RetrieveByInstanceIp(pkt.DstIP(), dstport, srcport)
+	// The reply is addressed to the namespace IP and port the flow left from,
+	// and sourced from the instance IP and port it was sent to.
+	entry, exist := proxy.proxycache.RetrieveByInstanceIp(
+		pkt.Protocol(), pkt.DstIP(), int(pkt.DstPort()), pkt.SrcIP(), int(pkt.SrcPort()))
 	if !exist {
 		return false
 	}
@@ -377,13 +620,13 @@ func (proxy *GoProxyTunnel) ingoingLoop(errchannel chan<- error) {
 // forward sends packetBytes to dstHost:dstPort over the tunnel, or - if the
 // destination is this machine - hands it straight to the ingoing pipeline
 // without going over the network at all.
-func (proxy *GoProxyTunnel) forward(dstHost net.IP, dstPort int, packetBytes []byte, attemptNumber int) {
+func (proxy *GoProxyTunnel) forward(dstHost netip.Addr, dstPort int, packetBytes []byte, attemptNumber int) {
 	if attemptNumber > 10 {
 		return
 	}
 
 	// If destination host is this machine, forward packet directly to the ingoing traffic method
-	if dstHost.Equal(proxy.localIP) {
+	if dstHost == proxy.localIP {
 		if logger.IsDebug() {
 			logger.DebugLogger().Println("Packet forwarded locally")
 		}
@@ -391,12 +634,11 @@ func (proxy *GoProxyTunnel) forward(dstHost net.IP, dstPort int, packetBytes []b
 		return
 	}
 
-	addr, ok := TableEntryCache.AddrFromIP(dstHost)
-	if !ok {
+	if !dstHost.IsValid() {
 		logger.ErrorLogger().Println("Invalid destination host:", dstHost)
 		return
 	}
-	key := netip.AddrPortFrom(addr, uint16(dstPort))
+	key := netip.AddrPortFrom(dstHost, uint16(dstPort))
 
 	proxy.connectionBufferLock.RLock()
 	con, exist := proxy.connectionBuffer[key]
@@ -410,11 +652,13 @@ func (proxy *GoProxyTunnel) forward(dstHost net.IP, dstPort int, packetBytes []b
 		}
 	}
 
+	con.lastUsed.Store(coarseClock.Load())
+
 	// net.UDPConn is safe for concurrent use - no lock needed around the
 	// write itself, only around the map lookup above.
-	_, err := con.Write(packetBytes)
+	_, err := con.conn.Write(packetBytes)
 	if err != nil {
-		_ = con.Close()
+		_ = con.conn.Close()
 		logger.ErrorLogger().Println(err)
 
 		// con is confirmed dead - evict it so dialAndStore's double-check
@@ -438,7 +682,7 @@ func (proxy *GoProxyTunnel) forward(dstHost net.IP, dstPort int, packetBytes []b
 // won the race to create one first - forward() can now run on several
 // goroutines at once (see retainForReplay), and dropping a duplicate on the
 // floor would leak its socket.
-func (proxy *GoProxyTunnel) dialAndStore(key netip.AddrPort) (*net.UDPConn, error) {
+func (proxy *GoProxyTunnel) dialAndStore(key netip.AddrPort) (*tunnelConn, error) {
 	connection, err := createUDPChannel(key)
 	if err != nil {
 		return nil, err
@@ -450,8 +694,48 @@ func (proxy *GoProxyTunnel) dialAndStore(key netip.AddrPort) (*net.UDPConn, erro
 		_ = connection.Close()
 		return existing, nil
 	}
-	proxy.connectionBuffer[key] = connection
-	return connection, nil
+	tc := &tunnelConn{conn: connection}
+	tc.lastUsed.Store(coarseClock.Load())
+	proxy.connectionBuffer[key] = tc
+	return tc, nil
+}
+
+// startConnectionEviction closes tunnel sockets that have gone unused, so the
+// descriptor and socket-buffer cost of talking to a node once doesn't persist
+// for the lifetime of the process.
+func (proxy *GoProxyTunnel) startConnectionEviction() {
+	ticker := time.NewTicker(connectionSweepInterval)
+	go func() {
+		for range ticker.C {
+			proxy.evictIdleConnections(connectionIdleTimeout)
+		}
+	}()
+}
+
+func (proxy *GoProxyTunnel) evictIdleConnections(timeout time.Duration) {
+	cutoff := coarseClock.Load() - int64(timeout.Seconds())
+
+	// Collect first, then close outside the lock: Close can block, and the
+	// datapath needs this map back.
+	var idle []*tunnelConn
+	proxy.connectionBufferLock.Lock()
+	for key, con := range proxy.connectionBuffer {
+		if con.lastUsed.Load() > cutoff {
+			continue
+		}
+		// Identity check, as in forward()'s error path: only remove the
+		// connection actually observed as idle, never a replacement that has
+		// since been dialled for the same peer.
+		if proxy.connectionBuffer[key] == con {
+			delete(proxy.connectionBuffer, key)
+			idle = append(idle, con)
+		}
+	}
+	proxy.connectionBufferLock.Unlock()
+
+	for _, con := range idle {
+		_ = con.conn.Close()
+	}
 }
 
 func createUDPChannel(raddr netip.AddrPort) (*net.UDPConn, error) {
@@ -489,15 +773,4 @@ func (proxy *GoProxyTunnel) GetStopCh() chan<- bool {
 // GetFinishCh returns the confirmation that the channel stopped listening for packets
 func (proxy *GoProxyTunnel) GetFinishCh() <-chan bool {
 	return proxy.finishChannel
-}
-
-// netIPFromAddr converts a netip.Addr to a net.IP in its 16-byte form, which
-// net.IP.Equal/net.IPNet.Contains compare correctly regardless of whether
-// the other side is a 4-byte or 16-byte representation of the same address.
-func netIPFromAddr(addr netip.Addr) net.IP {
-	if !addr.IsValid() {
-		return nil
-	}
-	b := addr.As16()
-	return net.IP(b[:])
 }

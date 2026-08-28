@@ -375,3 +375,119 @@ func TestParseRejectsUnknownVersion(t *testing.T) {
 		t.Error("Parse should reject an unknown IP version")
 	}
 }
+
+// --- fragment detection ---
+
+// TestUnfragmentedPacketIsNotAFragment matters as much as detecting real
+// fragments: the proxy keeps per-datagram translation state for anything that
+// reports IsFragment, so an ordinary packet must never look like one.
+func TestUnfragmentedPacketIsNotAFragment(t *testing.T) {
+	v4 := buildIPv4(t, "10.19.1.5", "10.30.255.255", &layers.TCP{SrcPort: 1, DstPort: 2, SYN: true}, []byte("payload"))
+	pkt, ok := Parse(v4)
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	if pkt.IsFragment() {
+		t.Error("an ordinary IPv4 packet must not report IsFragment")
+	}
+
+	v6 := buildIPv6(t, "fc00::1", "fdff::2", &layers.TCP{SrcPort: 1, DstPort: 2, SYN: true}, []byte("payload"))
+	pkt6, ok := Parse(v6)
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	if pkt6.IsFragment() {
+		t.Error("an ordinary IPv6 packet must not report IsFragment")
+	}
+}
+
+func TestIPv4FragmentAccessors(t *testing.T) {
+	wire := buildIPv4(t, "10.19.1.5", "10.30.255.255", &layers.UDP{SrcPort: 1, DstPort: 2}, []byte("payload"))
+	writeUint16(wire[4:6], 0xbeef) // identification
+
+	t.Run("first", func(t *testing.T) {
+		first := append([]byte(nil), wire...)
+		writeUint16(first[6:8], 0x2000) // MF, offset 0
+		pkt, ok := Parse(first)
+		if !ok {
+			t.Fatal("Parse failed")
+		}
+		if !pkt.IsFragment() || !pkt.IsFirstFragment() {
+			t.Errorf("IsFragment=%v IsFirstFragment=%v; want true/true", pkt.IsFragment(), pkt.IsFirstFragment())
+		}
+		if pkt.FragmentID() != 0xbeef {
+			t.Errorf("FragmentID = %#x; want 0xbeef", pkt.FragmentID())
+		}
+	})
+
+	t.Run("last", func(t *testing.T) {
+		last := append([]byte(nil), wire...)
+		writeUint16(last[6:8], 128) // offset 128*8, MF clear: the final fragment
+		pkt, ok := Parse(last)
+		if !ok {
+			t.Fatal("Parse failed")
+		}
+		if !pkt.IsFragment() || pkt.IsFirstFragment() {
+			t.Errorf("IsFragment=%v IsFirstFragment=%v; want true/false", pkt.IsFragment(), pkt.IsFirstFragment())
+		}
+		if pkt.FragmentID() != 0xbeef {
+			t.Errorf("FragmentID = %#x; want 0xbeef", pkt.FragmentID())
+		}
+	})
+}
+
+func TestIPv6FragmentAccessors(t *testing.T) {
+	// IPv6 header -> Fragment header -> UDP
+	udp := []byte{0, 1, 0, 2, 0, 8, 0, 0}
+	build := func(offset uint16, more bool) []byte {
+		buf := make([]byte, ipv6HeaderLen+8+len(udp))
+		buf[0] = 0x60
+		buf[6] = 44 // Fragment header
+		buf[7] = 64
+		writeUint16(buf[4:6], uint16(8+len(udp)))
+		copy(buf[8:24], net.ParseIP("fc00::1").To16())
+		copy(buf[24:40], net.ParseIP("fdff::2").To16())
+		buf[40] = ProtoUDP
+		offsetAndFlags := offset << 3
+		if more {
+			offsetAndFlags |= 1
+		}
+		writeUint16(buf[42:44], offsetAndFlags)
+		buf[44], buf[45], buf[46], buf[47] = 0xde, 0xad, 0xbe, 0xef
+		copy(buf[48:], udp)
+		return buf
+	}
+
+	first, ok := Parse(build(0, true))
+	if !ok {
+		t.Fatal("Parse failed for the first IPv6 fragment")
+	}
+	if !first.IsFragment() || !first.IsFirstFragment() {
+		t.Errorf("first fragment: IsFragment=%v IsFirstFragment=%v; want true/true",
+			first.IsFragment(), first.IsFirstFragment())
+	}
+	if first.Protocol() != ProtoUDP {
+		t.Errorf("protocol %d after the fragment header; want UDP", first.Protocol())
+	}
+	if !first.HasTransport() {
+		t.Error("the first IPv6 fragment carries the transport header")
+	}
+	if first.FragmentID() != 0xdeadbeef {
+		t.Errorf("FragmentID = %#x; want 0xdeadbeef", first.FragmentID())
+	}
+
+	later, ok := Parse(build(16, false))
+	if !ok {
+		t.Fatal("Parse failed for the later IPv6 fragment")
+	}
+	if !later.IsFragment() || later.IsFirstFragment() {
+		t.Errorf("later fragment: IsFragment=%v IsFirstFragment=%v; want true/false",
+			later.IsFragment(), later.IsFirstFragment())
+	}
+	if later.HasTransport() {
+		t.Error("a later IPv6 fragment must not report HasTransport")
+	}
+	if later.FragmentID() != 0xdeadbeef {
+		t.Errorf("FragmentID = %#x; want 0xdeadbeef", later.FragmentID())
+	}
+}

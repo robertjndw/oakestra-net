@@ -71,7 +71,13 @@ type TableManager struct {
 	// the cheap side of the trade.
 	byServiceIP map[netip.Addr][]TableEntry
 	byNsIP      map[netip.Addr]TableEntry
-	rwlock      sync.RWMutex
+	// generation counts index rebuilds. A cached route that was chosen under
+	// the current generation is known to still be current, which lets the
+	// packet path skip rescanning every replica of a service on each hit.
+	// Guarded by rwlock like the indexes, so a reader always sees a
+	// generation consistent with the entries it read alongside it.
+	generation uint64
+	rwlock     sync.RWMutex
 }
 
 func NewTableManager() TableManager {
@@ -126,18 +132,79 @@ func (t *TableManager) rebuildIndexesLocked() {
 	}
 	t.byServiceIP = byServiceIP
 	t.byNsIP = byNsIP
+	t.generation++
 }
 
 func (t *TableManager) Add(entry TableEntry) error {
-	if t.isValid(entry) {
-		entry.activity = events.GetOrCreate(entry.JobName)
-		t.rwlock.Lock()
-		defer t.rwlock.Unlock()
-		t.translationTable = append(t.translationTable, entry)
-		t.rebuildIndexesLocked()
-		return nil
+	if !t.isValid(entry) {
+		return errors.New("InvalidEntry")
 	}
-	return errors.New("InvalidEntry")
+	entry.activity = events.GetOrCreate(entry.JobName)
+
+	t.rwlock.Lock()
+	defer t.rwlock.Unlock()
+	t.translationTable = append(t.translationTable, entry)
+	t.rebuildIndexesLocked()
+	return nil
+}
+
+// ReplaceJobEntries swaps every entry belonging to jobName for a new set in a
+// single locked mutation. Doing it entry by entry - which is what the refresh
+// and cold-resolution paths used to do - rebuilds the indexes once per entry,
+// so refreshing a job with n instances costs O(n^2) index inserts while
+// holding the lock the packet path reads under.
+//
+// Validation happens before the lock is taken, so an invalid input leaves the
+// table untouched rather than half-replaced.
+func (t *TableManager) ReplaceJobEntries(jobName string, entries []TableEntry) error {
+	prepared := make([]TableEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !t.isValid(entry) {
+			return errors.New("InvalidEntry")
+		}
+		entry.activity = events.GetOrCreate(entry.JobName)
+		prepared = append(prepared, entry)
+	}
+
+	// Namespace IPs index a single entry each, so an incoming entry that
+	// reuses one has to displace whatever held it before.
+	replacedNsIPs := make(map[netip.Addr]struct{}, 2*len(prepared))
+	for _, entry := range prepared {
+		if addr, ok := AddrFromIP(entry.Nsip); ok {
+			replacedNsIPs[addr] = struct{}{}
+		}
+		if addr, ok := AddrFromIP(entry.Nsipv6); ok {
+			replacedNsIPs[addr] = struct{}{}
+		}
+	}
+
+	t.rwlock.Lock()
+	defer t.rwlock.Unlock()
+
+	kept := t.translationTable[:0]
+	for _, existing := range t.translationTable {
+		if existing.JobName == jobName || nsIPClaimed(existing, replacedNsIPs) {
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	t.translationTable = append(kept, prepared...)
+	t.rebuildIndexesLocked()
+	return nil
+}
+
+func nsIPClaimed(entry TableEntry, claimed map[netip.Addr]struct{}) bool {
+	if addr, ok := AddrFromIP(entry.Nsip); ok {
+		if _, taken := claimed[addr]; taken {
+			return true
+		}
+	}
+	if addr, ok := AddrFromIP(entry.Nsipv6); ok {
+		if _, taken := claimed[addr]; taken {
+			return true
+		}
+	}
+	return false
 }
 
 // remove by Namespace IP, which can be either in IPv4 or IPv6 format
@@ -156,36 +223,40 @@ func (t *TableManager) RemoveByNsip(nsip net.IP) error {
 		}
 	}
 
-	return t.removeByIndex(found)
+	if found < 0 {
+		return errors.New("entry not found")
+	}
+	logger.DebugLogger().Printf("Removing from TableManager: %v", t.translationTable[found])
+	t.removeByIndexLocked(found)
+	t.rebuildIndexesLocked()
+	return nil
 }
 
+// RemoveByJobName drops every entry for a job in a single pass, rebuilding the
+// indexes once at the end rather than once per removed entry.
 func (t *TableManager) RemoveByJobName(jobname string) error {
 	t.rwlock.Lock()
 	defer t.rwlock.Unlock()
 
-	elems := len(t.translationTable)
-	for i := 0; i < elems; i++ {
-		if t.translationTable[i].JobName == jobname {
-			err := t.removeByIndex(i)
-			if err != nil {
-				return err
-			}
-			elems = elems - 1
-			i = i - 1
+	kept := t.translationTable[:0]
+	for _, entry := range t.translationTable {
+		if entry.JobName == jobname {
+			logger.DebugLogger().Printf("Removing from TableManager: %v", entry)
+			continue
 		}
+		kept = append(kept, entry)
 	}
+	t.translationTable = kept
+	t.rebuildIndexesLocked()
 	return nil
 }
 
-func (t *TableManager) removeByIndex(index int) error {
-	if index > -1 {
-		logger.DebugLogger().Printf("Removing from TableManager: %v", t.translationTable[index])
-		t.translationTable[index] = t.translationTable[len(t.translationTable)-1]
-		t.translationTable = t.translationTable[:len(t.translationTable)-1]
-		t.rebuildIndexesLocked()
-		return nil
-	}
-	return errors.New("entry not found")
+// removeByIndexLocked swap-removes one entry without rebuilding the indexes.
+// Callers are responsible for calling rebuildIndexesLocked once they are done
+// mutating.
+func (t *TableManager) removeByIndexLocked(index int) {
+	t.translationTable[index] = t.translationTable[len(t.translationTable)-1]
+	t.translationTable = t.translationTable[:len(t.translationTable)-1]
 }
 
 // SearchByServiceIP looks up entries by ServiceIP. O(1) index lookup - the
@@ -195,24 +266,18 @@ func (t *TableManager) removeByIndex(index int) error {
 // wholesale rather than mutating a published bucket in place, so it's safe
 // to hand out directly. It's capped at its current length so an append by
 // the caller can't spill into (and silently reuse) the map's own capacity.
-func (t *TableManager) SearchByServiceIP(ip net.IP) []TableEntry {
-	addr, ok := AddrFromIP(ip)
-	if !ok {
-		return nil
-	}
+// It also returns the table generation the result was read under; see
+// TableManager.generation.
+func (t *TableManager) SearchByServiceIP(addr netip.Addr) ([]TableEntry, uint64) {
 	t.rwlock.RLock()
 	defer t.rwlock.RUnlock()
 	matches := t.byServiceIP[addr]
-	return matches[:len(matches):len(matches)]
+	return matches[:len(matches):len(matches)], t.generation
 }
 
 // SearchByNsIP looks up a single entry by namespace IP. O(1) index lookup -
 // see SearchByServiceIP.
-func (t *TableManager) SearchByNsIP(ip net.IP) (TableEntry, bool) {
-	addr, ok := AddrFromIP(ip)
-	if !ok {
-		return TableEntry{}, false
-	}
+func (t *TableManager) SearchByNsIP(addr netip.Addr) (TableEntry, bool) {
 	t.rwlock.RLock()
 	defer t.rwlock.RUnlock()
 	entry, found := t.byNsIP[addr]

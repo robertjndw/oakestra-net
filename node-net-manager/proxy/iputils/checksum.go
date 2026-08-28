@@ -47,3 +47,7 @@ func readUint16(b []byte) uint16 {
 func writeUint16(b []byte, v uint16) {
 	binary.BigEndian.PutUint16(b, v)
 }
+
+func readUint32(b []byte) uint32 {
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
