@@ -379,20 +379,26 @@ int tc_egress(struct __sk_buff *skb)
 	__u32 new_daddr = mapped_to_ipv4(&ct->backend_nsip);
 	__u32 new_saddr = mapped_to_ipv4(&ct->src_instance_ip);
 
-	bpf_l3_csum_replace(skb, offsetof(struct iphdr, check), old_daddr,
-			     new_daddr, 4);
-	bpf_l3_csum_replace(skb, offsetof(struct iphdr, check), old_saddr,
-			     new_saddr, 4);
+	/* skb byte offsets are absolute (from the start of the frame), not
+	 * relative to the IP header - every offsetof(struct iphdr, ...) below
+	 * needs ETH_HLEN added, or these land inside the Ethernet header
+	 * instead of the IP header and corrupt the frame. l4_csum_off is
+	 * already absolute (computed via pointer difference from `data`
+	 * further up), so it does not need the same adjustment. */
+	bpf_l3_csum_replace(skb, ETH_HLEN + offsetof(struct iphdr, check),
+			     old_daddr, new_daddr, 4);
+	bpf_l3_csum_replace(skb, ETH_HLEN + offsetof(struct iphdr, check),
+			     old_saddr, new_saddr, 4);
 	bpf_l4_csum_replace(skb, l4_csum_off, old_daddr, new_daddr,
 			     4 | BPF_F_PSEUDO_HDR);
 	bpf_l4_csum_replace(skb, l4_csum_off, old_saddr, new_saddr,
 			     4 | BPF_F_PSEUDO_HDR);
 
-	if (bpf_skb_store_bytes(skb, offsetof(struct iphdr, daddr), &new_daddr,
-				 4, 0) < 0)
+	if (bpf_skb_store_bytes(skb, ETH_HLEN + offsetof(struct iphdr, daddr),
+				 &new_daddr, 4, 0) < 0)
 		return TC_ACT_OK;
-	if (bpf_skb_store_bytes(skb, offsetof(struct iphdr, saddr), &new_saddr,
-				 4, 0) < 0)
+	if (bpf_skb_store_bytes(skb, ETH_HLEN + offsetof(struct iphdr, saddr),
+				 &new_saddr, 4, 0) < 0)
 		return TC_ACT_OK;
 
 	struct local_instance_val *local =
@@ -566,20 +572,22 @@ int tc_decap(struct __sk_buff *skb)
 		l4_csum_off = ((void *)&udp->check - data);
 	}
 
-	bpf_l3_csum_replace(skb, offsetof(struct iphdr, check), old_daddr,
-			     new_daddr, 4);
-	bpf_l3_csum_replace(skb, offsetof(struct iphdr, check), old_saddr,
-			     new_saddr, 4);
+	/* Absolute skb offsets again - see the comment on the equivalent block
+	 * in tc_egress. */
+	bpf_l3_csum_replace(skb, ETH_HLEN + offsetof(struct iphdr, check),
+			     old_daddr, new_daddr, 4);
+	bpf_l3_csum_replace(skb, ETH_HLEN + offsetof(struct iphdr, check),
+			     old_saddr, new_saddr, 4);
 	bpf_l4_csum_replace(skb, l4_csum_off, old_daddr, new_daddr,
 			     4 | BPF_F_PSEUDO_HDR);
 	bpf_l4_csum_replace(skb, l4_csum_off, old_saddr, new_saddr,
 			     4 | BPF_F_PSEUDO_HDR);
 
-	if (bpf_skb_store_bytes(skb, offsetof(struct iphdr, daddr), &new_daddr,
-				 4, 0) < 0)
+	if (bpf_skb_store_bytes(skb, ETH_HLEN + offsetof(struct iphdr, daddr),
+				 &new_daddr, 4, 0) < 0)
 		return TC_ACT_OK;
-	if (bpf_skb_store_bytes(skb, offsetof(struct iphdr, saddr), &new_saddr,
-				 4, 0) < 0)
+	if (bpf_skb_store_bytes(skb, ETH_HLEN + offsetof(struct iphdr, saddr),
+				 &new_saddr, 4, 0) < 0)
 		return TC_ACT_OK;
 
 	return redirect_to_local(c, local);
