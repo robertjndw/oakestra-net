@@ -2,24 +2,29 @@ package proxy
 
 import (
 	"NetManager/logger"
-	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type ConversionEntry struct {
-	srcip         net.IP
-	dstip         net.IP
-	dstServiceIp  net.IP
-	srcInstanceIp net.IP
+	srcip         netip.Addr
+	dstip         netip.Addr
+	dstServiceIp  netip.Addr
+	srcInstanceIp netip.Addr
 	srcport       int
 	dstport       int
+	// dstNode/dstNodePort cache which node dstip actually lives on, so the
+	// packet path doesn't need a second table lookup by namespace IP once a
+	// flow has an entry here - see outgoingProxy.
+	dstNode     netip.Addr
+	dstNodePort int
 }
 
 type ConversionList struct {
 	nextEntry int
-	// lastUsed holds a Unix timestamp (seconds since epoch, as from time.Now().Unix()).
+	// lastUsed holds a coarse Unix-seconds timestamp (see coarseClock below).
 	// It is atomic so retrieve methods can update it while holding only the
 	// cache's read lock (RLock), instead of requiring a write lock.
 	lastUsed       atomic.Int64
@@ -31,6 +36,22 @@ type ProxyCache struct {
 	cache                 []ConversionList
 	conversionListMaxSize int
 	rwlock                sync.RWMutex
+}
+
+// coarseClock is a 1Hz-updated Unix-seconds clock shared by every
+// ProxyCache entry. Recording "last used" on every cache hit doesn't need
+// second-level precision, so entries read this instead of each calling
+// time.Now() (a vDSO call) on every packet.
+var coarseClock atomic.Int64
+
+func init() {
+	coarseClock.Store(time.Now().Unix())
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		for range ticker.C {
+			coarseClock.Store(time.Now().Unix())
+		}
+	}()
 }
 
 func NewProxyCache() *ProxyCache {
@@ -57,7 +78,7 @@ func (cache *ProxyCache) evictOldEntries(timeout time.Duration) {
 	cache.rwlock.Lock()
 	defer cache.rwlock.Unlock()
 
-	now := time.Now().Unix()
+	now := coarseClock.Load()
 	timeoutSeconds := int64(timeout.Seconds())
 	evictedCount := 0
 	for i := range cache.cache {
@@ -75,7 +96,7 @@ func (cache *ProxyCache) evictOldEntries(timeout time.Duration) {
 }
 
 // RetrieveByServiceIP Retrieve proxy proxycache entry based on source ip and source port and destination ServiceIP
-func (cache *ProxyCache) RetrieveByServiceIP(srcip net.IP, instanceIP net.IP, srcport int, dstServiceIp net.IP, dstport int) (ConversionEntry, bool) {
+func (cache *ProxyCache) RetrieveByServiceIP(srcip netip.Addr, instanceIP netip.Addr, srcport int, dstServiceIp netip.Addr, dstport int) (ConversionEntry, bool) {
 	cache.rwlock.RLock()
 	defer cache.rwlock.RUnlock()
 
@@ -83,10 +104,10 @@ func (cache *ProxyCache) RetrieveByServiceIP(srcip net.IP, instanceIP net.IP, sr
 	if elem.conversionList != nil {
 		for _, cacheEntry := range elem.conversionList {
 			if cacheEntry.dstport == dstport &&
-				cacheEntry.dstServiceIp.Equal(dstServiceIp) &&
-				cacheEntry.srcip.Equal(srcip) &&
-				cacheEntry.srcInstanceIp.Equal(instanceIP) {
-				elem.lastUsed.Store(time.Now().Unix())
+				cacheEntry.dstServiceIp == dstServiceIp &&
+				cacheEntry.srcip == srcip &&
+				cacheEntry.srcInstanceIp == instanceIP {
+				elem.lastUsed.Store(coarseClock.Load())
 				return cacheEntry, true
 			}
 		}
@@ -95,15 +116,15 @@ func (cache *ProxyCache) RetrieveByServiceIP(srcip net.IP, instanceIP net.IP, sr
 }
 
 // RetrieveByInstanceIp Retrieve proxy proxycache entry based on source ip and source port and destination ip
-func (cache *ProxyCache) RetrieveByInstanceIp(srcip net.IP, srcport int, dstport int) (ConversionEntry, bool) {
+func (cache *ProxyCache) RetrieveByInstanceIp(srcip netip.Addr, srcport int, dstport int) (ConversionEntry, bool) {
 	cache.rwlock.RLock()
 	defer cache.rwlock.RUnlock()
 
 	elem := &cache.cache[srcport]
 	if elem.conversionList != nil {
 		for _, entry := range elem.conversionList {
-			if entry.dstport == dstport && entry.srcip.Equal(srcip) {
-				elem.lastUsed.Store(time.Now().Unix())
+			if entry.dstport == dstport && entry.srcip == srcip {
+				elem.lastUsed.Store(coarseClock.Load())
 				return entry, true
 			}
 		}
@@ -127,7 +148,7 @@ func (cache *ProxyCache) Add(entry ConversionEntry) {
 
 func (cache *ProxyCache) addToConversionList(entry ConversionEntry) {
 	elem := &cache.cache[entry.srcport]
-	elem.lastUsed.Store(time.Now().Unix())
+	elem.lastUsed.Store(coarseClock.Load())
 	alreadyExist := false
 	alreadyExistPosition := 0
 	//check if used port is already in proxycache

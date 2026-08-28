@@ -9,10 +9,11 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strconv"
-	"sync"
+	"time"
 
 	"github.com/songgao/water"
 )
@@ -55,14 +56,13 @@ func NewCustom(configuration Configuration) *GoProxyTunnel {
 		errorChannel:     make(chan error),
 		finishChannel:    make(chan bool),
 		stopChannel:      make(chan bool),
-		connectionBuffer: make(map[string]*net.UDPConn),
+		connectionBuffer: make(map[netip.AddrPort]*net.UDPConn),
 		proxycache:       NewProxyCache(),
-		udpwrite:         sync.RWMutex{},
-		tunwrite:         sync.RWMutex{},
-		incomingChannel:  make(chan incomingMessage, 1000),
-		outgoingChannel:  make(chan outgoingMessage, 1000),
 		mtusize:          strconv.Itoa(configuration.Mtusize),
-		randseed:         rand.New(rand.NewSource(42)),
+		// Seeded per-process (not with a fixed value) so every node picks a
+		// different round-robin sequence; a shared fixed seed meant every
+		// node made the exact same load-balancing choice.
+		randseed: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
 	// parse configuration file
@@ -192,9 +192,11 @@ func (proxy *GoProxyTunnel) createTun() {
 	if nil != err {
 		log.Fatal("Unable to listen on UDP socket:", err)
 	}
-	err = lstnConn.SetReadBuffer(BUFFER_SIZE)
+	err = lstnConn.SetReadBuffer(socketBufferSize)
 	if nil != err {
-		log.Fatal("Unable to set Read Buffer:", err)
+		// Not fatal: the socket still works with whatever the kernel's
+		// default/clamped size is, just more prone to drops under bursts.
+		logger.ErrorLogger().Println("Unable to grow UDP read buffer:", err)
 	}
 
 	proxy.HostTUNDeviceName = ifce.Name()

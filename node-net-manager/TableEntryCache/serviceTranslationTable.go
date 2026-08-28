@@ -1,13 +1,21 @@
 package TableEntryCache
 
 import (
+	"NetManager/events"
 	"NetManager/logger"
 	"errors"
 	"log"
 	"net"
+	"net/netip"
 	"regexp"
 	"sync"
 )
+
+// nameRegexp validates Appname/Appns/Servicename/Servicenamespace. Compiled
+// once at package init instead of on every call to isValid - isValid runs
+// once per table mutation, not per packet, but there is no reason to pay for
+// a regexp compile on every insert either.
+var nameRegexp = regexp.MustCompile("^[a-zA-Z0-9]{1,30}$")
 
 type TableEntry struct {
 	JobName          string      `json:"job_name"`
@@ -22,6 +30,19 @@ type TableEntry struct {
 	Nsip             net.IP      `json:"nsip"`
 	Nsipv6           net.IP      `json:"nsipv6"`
 	ServiceIP        []ServiceIP `json:"serviceIP"`
+	// activity tracks when this job was last used by the packet path, so the
+	// MQTT interest timer knows when to let the subscription expire. It's a
+	// pointer shared by every TableEntry copy for the same JobName (assigned
+	// once in Add), so Touch is a single atomic store - no lock, no map
+	// lookup, safe to call per packet.
+	activity *events.Activity `json:"-"`
+}
+
+// Touch marks this entry's job as just used. Safe to call on every packet.
+func (e TableEntry) Touch() {
+	if e.activity != nil {
+		e.activity.Touch()
+	}
 }
 
 type ServiceIpType int
@@ -40,22 +61,80 @@ type ServiceIP struct {
 
 type TableManager struct {
 	translationTable []TableEntry
-	rwlock           sync.RWMutex
+	// byServiceIP and byNsIP index translationTable by address so the packet
+	// path (SearchByServiceIP/SearchByNsIP) doesn't have to scan the whole
+	// table. They hold copies of TableEntry, never pointers into
+	// translationTable: removeByIndex swap-removes and Add can reallocate the
+	// backing array, either of which would leave a pointer into the old array
+	// dangling/stale. Rebuilt wholesale on every mutation - mutations happen
+	// on deployment/MQTT events, not per packet, so an O(n) rebuild here is
+	// the cheap side of the trade.
+	byServiceIP map[netip.Addr][]TableEntry
+	byNsIP      map[netip.Addr]TableEntry
+	rwlock      sync.RWMutex
 }
 
 func NewTableManager() TableManager {
 	return TableManager{
 		translationTable: make([]TableEntry, 0),
+		byServiceIP:      make(map[netip.Addr][]TableEntry),
+		byNsIP:           make(map[netip.Addr]TableEntry),
 		rwlock:           sync.RWMutex{},
 	}
 	// TODO cleanup of old entry every X seconds
 }
 
+// AddrFromIP converts a net.IP into a netip.Addr suitable for use as a map
+// key. Unmap is mandatory: net.ParseIP("10.0.0.1") stores a 16-byte
+// IPv4-in-IPv6 form, and netip.AddrFromSlice on 16 bytes returns an
+// Is4In6 address - which compares unequal (different internal
+// representation) to the plain Is4 address that iputils builds directly
+// from the wire bytes of a real IPv4 packet, even though both print the
+// same. Unmap normalizes 4-in-6 down to Is4 and is a no-op for a genuine
+// IPv6 address, so it is safe to call unconditionally.
+func AddrFromIP(ip net.IP) (netip.Addr, bool) {
+	if ip == nil {
+		return netip.Addr{}, false
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	return addr.Unmap(), true
+}
+
+// rebuildIndexesLocked recomputes byServiceIP/byNsIP from translationTable.
+// Caller must hold rwlock for writing.
+func (t *TableManager) rebuildIndexesLocked() {
+	byServiceIP := make(map[netip.Addr][]TableEntry, len(t.byServiceIP))
+	byNsIP := make(map[netip.Addr]TableEntry, len(t.translationTable))
+	for _, entry := range t.translationTable {
+		if addr, ok := AddrFromIP(entry.Nsip); ok {
+			byNsIP[addr] = entry
+		}
+		if addr, ok := AddrFromIP(entry.Nsipv6); ok {
+			byNsIP[addr] = entry
+		}
+		for _, sip := range entry.ServiceIP {
+			if addr, ok := AddrFromIP(sip.Address); ok {
+				byServiceIP[addr] = append(byServiceIP[addr], entry)
+			}
+			if addr, ok := AddrFromIP(sip.Address_v6); ok {
+				byServiceIP[addr] = append(byServiceIP[addr], entry)
+			}
+		}
+	}
+	t.byServiceIP = byServiceIP
+	t.byNsIP = byNsIP
+}
+
 func (t *TableManager) Add(entry TableEntry) error {
 	if t.isValid(entry) {
+		entry.activity = events.GetOrCreate(entry.JobName)
 		t.rwlock.Lock()
 		defer t.rwlock.Unlock()
 		t.translationTable = append(t.translationTable, entry)
+		t.rebuildIndexesLocked()
 		return nil
 	}
 	return errors.New("InvalidEntry")
@@ -103,38 +182,42 @@ func (t *TableManager) removeByIndex(index int) error {
 		logger.DebugLogger().Printf("Removing from TableManager: %v", t.translationTable[index])
 		t.translationTable[index] = t.translationTable[len(t.translationTable)-1]
 		t.translationTable = t.translationTable[:len(t.translationTable)-1]
+		t.rebuildIndexesLocked()
 		return nil
 	}
 	return errors.New("entry not found")
 }
 
+// SearchByServiceIP looks up entries by ServiceIP. O(1) index lookup plus a
+// copy of the matching bucket - the previous implementation scanned every
+// entry's ServiceIP list on every call, on the packet path, per packet.
 func (t *TableManager) SearchByServiceIP(ip net.IP) []TableEntry {
-	// log.Println("Table research, table length: ", len(t.translationTable))
-	// log.Println(t.translationTable)
-	result := make([]TableEntry, 0)
+	addr, ok := AddrFromIP(ip)
+	if !ok {
+		return make([]TableEntry, 0)
+	}
 	t.rwlock.RLock()
 	defer t.rwlock.RUnlock()
-	for _, tableElement := range t.translationTable {
-		for _, elemip := range tableElement.ServiceIP {
-			if elemip.Address.Equal(ip) || elemip.Address_v6.Equal(ip) {
-				returnEntry := tableElement
-				result = append(result, returnEntry)
-			}
-		}
+	matches := t.byServiceIP[addr]
+	if len(matches) == 0 {
+		return make([]TableEntry, 0)
 	}
+	result := make([]TableEntry, len(matches))
+	copy(result, matches)
 	return result
 }
 
+// SearchByNsIP looks up a single entry by namespace IP. O(1) index lookup -
+// see SearchByServiceIP.
 func (t *TableManager) SearchByNsIP(ip net.IP) (TableEntry, bool) {
+	addr, ok := AddrFromIP(ip)
+	if !ok {
+		return TableEntry{}, false
+	}
 	t.rwlock.RLock()
 	defer t.rwlock.RUnlock()
-	for _, tableElement := range t.translationTable {
-		if tableElement.Nsip.Equal(ip) || tableElement.Nsipv6.Equal(ip) {
-			returnEntry := tableElement
-			return returnEntry, true
-		}
-	}
-	return TableEntry{}, false
+	entry, found := t.byNsIP[addr]
+	return entry, found
 }
 
 func (t *TableManager) SearchByNodeIp(ip net.IP) []TableEntry {
@@ -173,21 +256,19 @@ func (t *TableManager) SearchByJobName(jobname string) []TableEntry {
 // Nsipv6 != nil
 // len(entry.ServiceIP)>0
 func (t *TableManager) isValid(entry TableEntry) bool {
-	r, _ := regexp.Compile("^[a-zA-Z0-9]{1,30}$")
-
-	if !r.MatchString(entry.Appname) {
+	if !nameRegexp.MatchString(entry.Appname) {
 		log.Println("TranslationTable: Invalid Entry, wrong appname:", entry.Appname)
 		return false
 	}
-	if !r.MatchString(entry.Appns) {
+	if !nameRegexp.MatchString(entry.Appns) {
 		log.Println("TranslationTable: Invalid Entry, wrong appns:", entry.Appns)
 		return false
 	}
-	if !r.MatchString(entry.Servicename) {
+	if !nameRegexp.MatchString(entry.Servicename) {
 		log.Println("TranslationTable: Invalid Entry, wrong servicename:", entry.Servicename)
 		return false
 	}
-	if !r.MatchString(entry.Servicenamespace) {
+	if !nameRegexp.MatchString(entry.Servicenamespace) {
 		log.Println("TranslationTable: Invalid Entry, wrong servicens:", entry.Servicenamespace)
 		return false
 	}

@@ -1,90 +1,75 @@
+// Package events tracks per-target "last used" activity.
+//
+// It used to be a channel-based pub/sub: GetTableEntryByServiceIP fired an
+// Emit on every packet that hit a job's ServiceIP, and the interest
+// self-destruct timer in mqtt/MqttJobUpdates.go consumed it to reset its
+// idle countdown. That meant every packet took a process-global RWMutex and
+// hashed a string map key just to keep a timer alive.
+//
+// Activity replaces that with a single atomic timestamp per target, handed
+// out once (when a table entry is created, not per packet) and touched with
+// one atomic store. The self-destruct timer polls it instead of blocking on
+// a channel - it only checked every 10s anyway.
 package events
 
 import (
-	"errors"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
-type EventManager interface {
-	Emit(event Event)
-	Register(eventType EventType, eventTarget string) (chan Event, error)
-	DeRegister(eventType EventType, eventTarget string)
+// Activity is a per-target last-used timestamp. The zero value reports as
+// "never touched".
+type Activity struct {
+	stamp atomic.Int64 // Unix seconds, 0 = never touched
 }
 
-type Events struct {
-	//map of event target to event kind
-	eventTableQueryChannelQueue map[string]chan Event
+// Touch records that target was just used. Safe to call from any goroutine;
+// does not allocate or block.
+func (a *Activity) Touch() {
+	a.stamp.Store(time.Now().Unix())
 }
 
-type Event struct {
-	EventType    EventType
-	EventTarget  string
-	EventMessage string
+// IdleFor returns how long it has been since the last Touch. An Activity
+// that has never been touched reports as idle forever.
+func (a *Activity) IdleFor() time.Duration {
+	last := a.stamp.Load()
+	if last == 0 {
+		return time.Duration(1<<63 - 1)
+	}
+	return time.Since(time.Unix(last, 0))
 }
 
-type EventType int
-
-const (
-	TableQuery EventType = iota
-)
-
-/* ------------- singleton instance ------- */
-var once sync.Once
-var rwlock sync.RWMutex
 var (
-	eventInstance EventManager
+	registryMu sync.RWMutex
+	registry   = make(map[string]*Activity)
 )
 
-/* ------------------------------------------*/
+// GetOrCreate returns the shared Activity for target, creating it if this is
+// the first time target has been seen. Called when a table entry is
+// added/refreshed - not on the packet path.
+func GetOrCreate(target string) *Activity {
+	registryMu.RLock()
+	a, ok := registry[target]
+	registryMu.RUnlock()
+	if ok {
+		return a
+	}
 
-func GetInstance() EventManager {
-	once.Do(func() {
-		eventInstance = &Events{
-			eventTableQueryChannelQueue: make(map[string]chan Event, 0),
-		}
-	})
-	return eventInstance
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	if a, ok = registry[target]; ok {
+		return a
+	}
+	a = &Activity{}
+	registry[target] = a
+	return a
 }
 
-func (e *Events) Emit(event Event) {
-	rwlock.RLock()
-	defer rwlock.RUnlock()
-	switch event.EventType {
-	case TableQuery:
-		channel := e.eventTableQueryChannelQueue[event.EventTarget]
-		if channel != nil {
-			//check channel buffer capacity to prevent blocking. If this is false, probably no receiver is active.
-			if len(channel) < cap(channel) {
-				channel <- event
-			}
-		}
-	}
-}
-
-func (e *Events) Register(eventType EventType, eventTarget string) (chan Event, error) {
-	rwlock.Lock()
-	defer rwlock.Unlock()
-	switch eventType {
-	case TableQuery:
-		channel := e.eventTableQueryChannelQueue[eventTarget]
-		if channel == nil {
-			channel = make(chan Event, 10)
-		}
-		e.eventTableQueryChannelQueue[eventTarget] = channel
-		return channel, nil
-	}
-	return nil, errors.New("Invalid EventType")
-}
-
-func (e *Events) DeRegister(eventType EventType, eventTarget string) {
-	rwlock.Lock()
-	defer rwlock.Unlock()
-	switch eventType {
-	case TableQuery:
-		channel := e.eventTableQueryChannelQueue[eventTarget]
-		if channel != nil {
-			e.eventTableQueryChannelQueue[eventTarget] = nil
-			close(channel)
-		}
-	}
+// Delete removes the Activity for target once its interest has been torn
+// down, so the registry doesn't grow with every job ever seen.
+func Delete(target string) {
+	registryMu.Lock()
+	delete(registry, target)
+	registryMu.Unlock()
 }

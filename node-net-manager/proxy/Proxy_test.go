@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"math/rand"
 	"net"
+	"net/netip"
 	"testing"
 
 	"github.com/google/gopacket"
@@ -17,8 +18,6 @@ type FakeEnv struct {
 
 // used as example packets for testing
 var ipv6Packet string = "600219310028063ffc000000000000000000000000000203fdff1000000000000000000000000001b98400502a8697ed00000000a002ff322a8900000204056e0402080a7fb1168c0000000001030307"
-var ipv4Packet string = "4500003471ab40003f06b54e0a1e00130a120088a8fc0050866d4e41ec673059801001f6a3fd00000101080aac259946269fb537"
-var ipv4SYNPacket string = "4500003cf20440003f0635810a1e00010a120006b5a2005071f2e51a00000000a002fd5c8ee50000020405820402080a3b625f570000000001030307"
 
 func (fakeenv *FakeEnv) GetTableEntryByServiceIP(ip net.IP) []TableEntryCache.TableEntry {
 	entrytable := make([]TableEntryCache.TableEntry, 0)
@@ -96,189 +95,178 @@ func getFakeTunnel() *GoProxyTunnel {
 			IP:   net.ParseIP("fdff::"),
 			Mask: net.CIDRMask(16, 128),
 		},
+		connectionBuffer: make(map[netip.AddrPort]*net.UDPConn),
 	}
 	tunnel.SetEnvironment(&FakeEnv{})
 	return tunnel
 }
 
-func getFakePacket(srcIP string, dstIP string, srcPort int, dstPort int) (gopacket.Packet, iputils.NetworkLayerPacket, iputils.TransportLayerProtocol) {
-	ipLayer := &iputils.IPv4Packet{IPv4: &layers.IPv4{
-		SrcIP:    net.ParseIP(srcIP),
-		DstIP:    net.ParseIP(dstIP),
-		Protocol: layers.IPProtocolTCP,
+// buildTestPacketV4/V6 build a valid, correctly-checksummed wire-format TCP
+// packet for feeding into iputils.Parse - gopacket is only used here, as a
+// test fixture builder, never by the production code in this package.
+func buildTestPacketV4(t testing.TB, srcIP, dstIP string, srcPort, dstPort int) []byte {
+	t.Helper()
+	ip := &layers.IPv4{
 		Version:  4,
-	}}
-	tcpLayer := &iputils.TCPLayer{TCP: &layers.TCP{
+		IHL:      5,
+		TTL:      64,
+		Protocol: layers.IPProtocolTCP,
+		SrcIP:    net.ParseIP(srcIP).To4(),
+		DstIP:    net.ParseIP(dstIP).To4(),
+	}
+	tcp := &layers.TCP{
 		SrcPort: layers.TCPPort(srcPort),
 		DstPort: layers.TCPPort(dstPort),
 		SYN:     true,
-	}}
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		FixLengths:       true,
-		ComputeChecksums: false,
 	}
-	ip := ipLayer.GetLayer().(*layers.IPv4)
-	tcpLayer.GetTCPLayer().SetNetworkLayerForChecksum(ip)
-	_ = gopacket.SerializeLayers(buf, opts, ipLayer.GetLayer().(*layers.IPv4), tcpLayer.GetTCPLayer())
-	return gopacket.NewPacket(buf.Bytes(), layers.LayerTypeIPv4, gopacket.Default), ipLayer, tcpLayer
+	_ = tcp.SetNetworkLayerForChecksum(ip)
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buf, opts, ip, tcp); err != nil {
+		t.Fatalf("build IPv4 packet: %v", err)
+	}
+	return append([]byte(nil), buf.Bytes()...)
 }
 
-func getFakeV6Packet(srcIP string, dstIP string, srcPort int, dstPort int) (gopacket.Packet, iputils.NetworkLayerPacket, iputils.TransportLayerProtocol) {
-	ipLayer := &iputils.IPv6Packet{IPv6: &layers.IPv6{
+func buildTestPacketV6(t testing.TB, srcIP, dstIP string, srcPort, dstPort int) []byte {
+	t.Helper()
+	ip := &layers.IPv6{
+		Version:    6,
+		HopLimit:   64,
+		NextHeader: layers.IPProtocolTCP,
 		SrcIP:      net.ParseIP(srcIP),
 		DstIP:      net.ParseIP(dstIP),
-		NextHeader: layers.IPProtocolTCP,
-		Version:    6,
-	}, IPv6Fragment: nil} // no IPv6 fragment in IPv6Packet struct
-	tcpLayer := &iputils.TCPLayer{TCP: &layers.TCP{
+	}
+	tcp := &layers.TCP{
 		SrcPort: layers.TCPPort(srcPort),
 		DstPort: layers.TCPPort(dstPort),
 		SYN:     true,
-	}}
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		FixLengths:       true,
-		ComputeChecksums: false,
 	}
-	ip := ipLayer.GetLayer().(*layers.IPv6)
-	tcpLayer.GetTCPLayer().SetNetworkLayerForChecksum(ip)
-	_ = gopacket.SerializeLayers(buf, opts, ipLayer.GetLayer().(*layers.IPv6), tcpLayer.GetTCPLayer())
-	return gopacket.NewPacket(buf.Bytes(), layers.LayerTypeIPv6, gopacket.Default), ipLayer, tcpLayer
+	_ = tcp.SetNetworkLayerForChecksum(ip)
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buf, opts, ip, tcp); err != nil {
+		t.Fatalf("build IPv6 packet: %v", err)
+	}
+	return append([]byte(nil), buf.Bytes()...)
+}
+
+func parseTestPacket(t *testing.T, wire []byte) iputils.Packet {
+	t.Helper()
+	pkt, ok := iputils.Parse(wire)
+	if !ok || !pkt.HasTransport() {
+		t.Fatalf("failed to parse test packet (ok=%v)", ok)
+	}
+	return pkt
 }
 
 func TestOutgoingProxy(t *testing.T) {
 	proxy := getFakeTunnel()
 
-	_, ip, tcp := getFakePacket("10.19.1.1", "10.30.255.255", 666, 80)
-	_, noip, notcp := getFakePacket("10.19.1.1", "10.20.1.1", 666, 80)
+	pkt := parseTestPacket(t, buildTestPacketV4(t, "10.19.1.1", "10.30.255.255", 666, 80))
+	noProxyPkt := parseTestPacket(t, buildTestPacketV4(t, "10.19.1.1", "10.20.1.1", 666, 80))
 
-	newpacketproxy := proxy.outgoingProxy(ip, tcp)
-	newpacketnoproxy := proxy.outgoingProxy(noip, notcp)
-	if newpacketnoproxy != nil {
+	if _, _, proxied := proxy.outgoingProxy(&noProxyPkt); proxied {
 		t.Error("Packet should not be proxied")
 	}
 
-	if ipLayer := newpacketproxy.Layer(layers.LayerTypeIPv4); ipLayer != nil {
-		if tcpLayer := newpacketproxy.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-
-			ipv4, _ := ipLayer.(*layers.IPv4)
-			dstexpected := net.ParseIP("10.19.2.12")
-			if !ipv4.DstIP.Equal(dstexpected) {
-				t.Error("dstIP = ", ipv4.DstIP.String(), "; want =", dstexpected)
-			}
-			//tcp, _ := tcpLayer.(*layers.TCP)
-			//if !(tcp.SrcPort == layers.TCPPort(proxy.TunnelPort)) {
-			//	t.Error("srcPort = ", tcp.SrcPort.String(), "; want = ", proxy.TunnelPort)
-			//}
-		}
+	if _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
+		t.Fatal("packet should have been proxied")
+	}
+	dstexpected := netip.MustParseAddr("10.19.2.12")
+	if pkt.DstIP() != dstexpected {
+		t.Error("dstIP = ", pkt.DstIP().String(), "; want =", dstexpected)
 	}
 }
 
 func TestIngoingProxy(t *testing.T) {
 	proxy := getFakeTunnel()
 
-	_, ip, tcp := getFakePacket("10.30.0.5", "10.19.1.15", 666, 777)
-	_, noip, notcp := getFakePacket("10.19.2.1", "10.19.1.12", 666, 80)
-
 	//update proxy proxycache
 	entry := ConversionEntry{
-		srcip:         net.ParseIP("10.19.1.15"),
-		dstip:         net.ParseIP("10.19.2.1"),
-		dstServiceIp:  net.ParseIP("10.30.255.255"),
-		srcInstanceIp: net.ParseIP("10.30.0.50"),
+		srcip:         netip.MustParseAddr("10.19.1.15"),
+		dstip:         netip.MustParseAddr("10.19.2.1"),
+		dstServiceIp:  netip.MustParseAddr("10.30.255.255"),
+		srcInstanceIp: netip.MustParseAddr("10.30.0.50"),
 		srcport:       777,
 		dstport:       666,
 	}
 	proxy.proxycache.Add(entry)
 
-	newpacketproxy := proxy.ingoingProxy(ip, tcp)
-	newpacketnoproxy := proxy.ingoingProxy(noip, notcp)
+	pkt := parseTestPacket(t, buildTestPacketV4(t, "10.30.0.5", "10.19.1.15", 666, 777))
+	noProxyPkt := parseTestPacket(t, buildTestPacketV4(t, "10.19.2.1", "10.19.1.12", 666, 80))
 
-	if ipLayer := newpacketproxy.Layer(layers.LayerTypeIPv4); ipLayer != nil {
-		if tcpLayer := newpacketproxy.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-
-			ipv4, _ := ipLayer.(*layers.IPv4)
-			srcexpected := net.ParseIP("10.30.255.255")
-			if !ipv4.SrcIP.Equal(srcexpected) {
-				t.Error("srcIp = ", ipv4.SrcIP.String(), "; want =", srcexpected)
-			}
-
-			//tcp, _ := tcpLayer.(*layers.TCP)
-			//if !(int(tcp.DstPort) == entry.srcport) {
-			//	t.Error("dstPort = ", int(tcp.DstPort), "; want = ", entry.srcport)
-			//}
-		}
-	}
-	if newpacketnoproxy != nil {
+	if proxy.ingoingProxy(&noProxyPkt) {
 		t.Error("Packet should not be proxied")
+	}
+
+	if !proxy.ingoingProxy(&pkt) {
+		t.Fatal("packet should have matched the reverse cache entry")
+	}
+	srcexpected := netip.MustParseAddr("10.30.255.255")
+	if pkt.SrcIP() != srcexpected {
+		t.Error("srcIp = ", pkt.SrcIP().String(), "; want =", srcexpected)
 	}
 }
 
 func TestOutgoingV6Proxy(t *testing.T) {
 	proxy := getFakeTunnel()
 
-	_, ip, tcp := getFakeV6Packet("fc00::1", "fdff:2000::ff", 666, 80)
-	_, noip, notcp := getFakeV6Packet("fc00::1", "fd00::12", 666, 80)
+	pkt := parseTestPacket(t, buildTestPacketV6(t, "fc00::1", "fdff:2000::ff", 666, 80))
+	noProxyPkt := parseTestPacket(t, buildTestPacketV6(t, "fc00::1", "fd00::12", 666, 80))
 
-	newpacketproxy := proxy.outgoingProxy(ip, tcp)
-	newpacketnoproxy := proxy.outgoingProxy(noip, notcp)
-	if newpacketnoproxy != nil {
+	if _, _, proxied := proxy.outgoingProxy(&noProxyPkt); proxied {
 		t.Error("Packet should not be proxied")
 	}
 
-	if ipLayer := newpacketproxy.Layer(layers.LayerTypeIPv6); ipLayer != nil {
-		if tcpLayer := newpacketproxy.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-
-			ipv6, _ := ipLayer.(*layers.IPv6)
-			dstexpected := net.ParseIP("fd00::12")
-			if !ipv6.DstIP.Equal(dstexpected) {
-				t.Error("dstIP = ", ipv6.DstIP.String(), "; want =", dstexpected)
-			}
-		}
+	if _, _, proxied := proxy.outgoingProxy(&pkt); !proxied {
+		t.Fatal("packet should have been proxied")
+	}
+	dstexpected := netip.MustParseAddr("fd00::12")
+	if pkt.DstIP() != dstexpected {
+		t.Error("dstIP = ", pkt.DstIP().String(), "; want =", dstexpected)
 	}
 }
 
 func TestIngoingV6Proxy(t *testing.T) {
 	proxy := getFakeTunnel()
 
-	_, ip, tcp := getFakeV6Packet("fdff::12", "fc00::15", 666, 777)
-	_, noip, notcp := getFakeV6Packet("fc00::1", "fd00::12", 666, 80)
-
 	//update proxy proxycache
 	entry := ConversionEntry{
-		srcip:         net.ParseIP("fc00::15"),
-		dstip:         net.ParseIP("fd00::12"),
-		dstServiceIp:  net.ParseIP("fdff:3000::ff"),
-		srcInstanceIp: net.ParseIP("fdff::12"),
+		srcip:         netip.MustParseAddr("fc00::15"),
+		dstip:         netip.MustParseAddr("fd00::12"),
+		dstServiceIp:  netip.MustParseAddr("fdff:3000::ff"),
+		srcInstanceIp: netip.MustParseAddr("fdff::12"),
 		srcport:       777,
 		dstport:       666,
 	}
 	proxy.proxycache.Add(entry)
-	newpacketproxy := proxy.ingoingProxy(ip, tcp)
-	newpacketnoproxy := proxy.ingoingProxy(noip, notcp)
-	if newpacketnoproxy != nil {
+
+	pkt := parseTestPacket(t, buildTestPacketV6(t, "fdff::12", "fc00::15", 666, 777))
+	noProxyPkt := parseTestPacket(t, buildTestPacketV6(t, "fc00::1", "fd00::12", 666, 80))
+
+	if proxy.ingoingProxy(&noProxyPkt) {
 		t.Error("Packet should not be proxied")
 	}
 
-	if ipLayer := newpacketproxy.Layer(layers.LayerTypeIPv6); ipLayer != nil {
-		if tcpLayer := newpacketproxy.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-
-			ipv6, _ := ipLayer.(*layers.IPv6)
-			srcexpected := net.ParseIP("fdff:3000::ff")
-			if !ipv6.SrcIP.Equal(srcexpected) {
-				t.Error("srcIp = ", ipv6.SrcIP.String(), "; want =", srcexpected)
-			}
-		}
+	if !proxy.ingoingProxy(&pkt) {
+		t.Fatal("packet should have matched the reverse cache entry")
+	}
+	srcexpected := netip.MustParseAddr("fdff:3000::ff")
+	if pkt.SrcIP() != srcexpected {
+		t.Error("srcIp = ", pkt.SrcIP().String(), "; want =", srcexpected)
 	}
 }
 
 func TestIPv6NextHeader(t *testing.T) {
-	// keep this test in, since the IPv6defragmenter seemed to mess up the parsing of the packet afterwards.
-	// for future safety
+	// keep this test in, since the IPv6 extension header walk seemed to mess
+	// up the parsing of the packet afterwards. for future safety
 	msg, _ := hex.DecodeString(ipv6Packet)
-	ip, _ := decodePacket(msg)
-	if ip.GetNextHeader() != 6 {
+	pkt, ok := iputils.Parse(msg)
+	if !ok {
+		t.Fatal("failed to parse test packet")
+	}
+	if pkt.Protocol() != iputils.ProtoTCP {
 		t.Error("Failed to detect TCP Header in IPv6 Next Header field.")
 	}
 }

@@ -2,7 +2,6 @@ package env
 
 import (
 	"NetManager/TableEntryCache"
-	"NetManager/events"
 	"NetManager/logger"
 	"NetManager/model"
 	"NetManager/mqtt"
@@ -16,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -50,6 +50,11 @@ type Environment struct {
 	proxyName         string
 	config            Configuration
 	translationTable  TableEntryCache.TableManager
+	// resolvingServiceIPs/failedServiceIPs dedup and rate-limit background
+	// table-query resolution on a ServiceIP miss (see GetTableEntryByServiceIP).
+	// Zero value of sync.Map is ready to use, no constructor changes needed.
+	resolvingServiceIPs sync.Map // ip.String() -> struct{}, present while a query is in flight
+	failedServiceIPs    sync.Map // ip.String() -> time.Time of the last failed attempt
 	//### Deployment management variables
 	deployedServices     map[string]service // all the deployed services with the ip and ports
 	deployedServicesLock sync.RWMutex
@@ -468,35 +473,79 @@ func (env *Environment) GetTableEntriesOnNode() []TableEntryCache.TableEntry {
 	return env.translationTable.SearchByNodeIp(ip)
 }
 
+// negativeResolveCacheTTL bounds how often a repeatedly-missed ServiceIP is
+// retried once a resolution attempt has failed. Without it, a sustained
+// stream of packets to an unresolvable VIP would kick off a fresh background
+// query (and its up-to-5s MQTT round trip) every time the previous one's
+// in-flight marker clears.
+const negativeResolveCacheTTL = 2 * time.Second
+
 // GetTableEntryByServiceIP Given a ServiceIP this method performs a search in the local ServiceCache
-// If the entry is not present a TableQuery is performed and the interest registered
+// If the entry is not present, resolution is kicked off in the background and this call returns
+// nothing for the current packet - see resolveServiceIPOnce for why this must not block.
 func (env *Environment) GetTableEntryByServiceIP(ip net.IP) []TableEntryCache.TableEntry {
 	// If entry already available
 	table := env.translationTable.SearchByServiceIP(ip)
 	if len(table) > 0 {
-		// Fire table instance usage event
-		events.GetInstance().Emit(events.Event{
-			EventType:   events.TableQuery,
-			EventTarget: table[0].JobName,
-		})
+		// mark the job as just used, so its MQTT interest doesn't expire
+		table[0].Touch()
 		return table
 	}
 
-	// if no entry available -> TableQuery
-	entryList, err := tableQueryByIP(ip)
+	// Miss: resolving requires a blocking MQTT round trip (up to ~5s, see
+	// mqtt.Tablequery). This is called from the single outgoing-packet
+	// goroutine, so doing that inline here would stall every flow on the
+	// node, not just this one. Drop this packet and resolve in the
+	// background instead; a TCP retransmit (or application-level UDP retry)
+	// will go through once the entry lands in the table.
+	env.resolveServiceIPOnce(ip)
+	return nil
+}
 
-	if err == nil {
-		var once sync.Once
-		for _, tableEntry := range entryList {
-			once.Do(func() { mqtt.MqttRegisterInterest(tableEntry.JobName, env) })
-			env.AddTableQueryEntry(tableEntry)
+// resolveServiceIPOnce kicks off background resolution for ip, unless a
+// query for it is already in flight or one failed too recently (see
+// negativeResolveCacheTTL). This bounds a packet storm against an
+// unresolvable ServiceIP to roughly one query per negativeResolveCacheTTL +
+// the query's own timeout, instead of one per packet.
+func (env *Environment) resolveServiceIPOnce(ip net.IP) {
+	key := ip.String()
+
+	if failedAt, ok := env.failedServiceIPs.Load(key); ok {
+		if time.Since(failedAt.(time.Time)) < negativeResolveCacheTTL {
+			return
 		}
-		table = env.translationTable.SearchByServiceIP(ip)
-		// register interest for sip as well to avoid querying the address too many times
-		mqtt.MqttRegisterInterest(ip.String(), env)
 	}
 
-	return table
+	if _, alreadyResolving := env.resolvingServiceIPs.LoadOrStore(key, struct{}{}); alreadyResolving {
+		return
+	}
+
+	go func() {
+		defer env.resolvingServiceIPs.Delete(key)
+		if err := env.resolveServiceIP(ip); err != nil {
+			env.failedServiceIPs.Store(key, time.Now())
+		} else {
+			env.failedServiceIPs.Delete(key)
+		}
+	}()
+}
+
+// resolveServiceIP performs the actual (blocking) table query and populates
+// the translation table. Must only ever run off the packet path.
+func (env *Environment) resolveServiceIP(ip net.IP) error {
+	entryList, err := tableQueryByIP(ip)
+	if err != nil {
+		return err
+	}
+
+	var once sync.Once
+	for _, tableEntry := range entryList {
+		once.Do(func() { mqtt.MqttRegisterInterest(tableEntry.JobName, env) })
+		env.AddTableQueryEntry(tableEntry)
+	}
+	// register interest for sip as well to avoid querying the address too many times
+	mqtt.MqttRegisterInterest(ip.String(), env)
+	return nil
 }
 
 // GetTableEntryByInstanceIP Given a ServiceIP this method performs a search in the local ServiceCache

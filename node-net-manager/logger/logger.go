@@ -31,6 +31,14 @@ func SetDebugMode() {
 	debugMode = true
 }
 
+// IsDebug reports whether debug logging is enabled. Hot paths should guard
+// DebugLogger() calls with this: DebugLogger() only discards the *output*,
+// it still formats every argument (including allocating net.IP.String()
+// calls) and pays for the log.Logger mutex even when nothing is printed.
+func IsDebug() bool {
+	return debugMode
+}
+
 func InfoLogger() *log.Logger {
 	infoonce.Do(func() {
 		infologger = log.New(os.Stdout, "INFO-", log.Ldate|log.Ltime|log.Lshortfile)

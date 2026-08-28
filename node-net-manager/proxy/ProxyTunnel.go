@@ -5,18 +5,26 @@ import (
 	"NetManager/env"
 	"NetManager/logger"
 	"NetManager/proxy/iputils"
-	"fmt"
 	"math/rand"
 	"net"
+	"net/netip"
 	"sync"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 	"github.com/songgao/water"
 )
 
-// const
-var BUFFER_SIZE = 64 * 1024
+// packetReadBufferSize is how much is read per packet off the TUN device or
+// UDP socket - generous headroom over any realistic MTU, but deliberately
+// NOT the same constant as socketBufferSize below: that one sizes the
+// kernel's socket buffer, and reusing it here would size every pooled
+// per-packet buffer at multiple megabytes for no benefit.
+const packetReadBufferSize = 64 * 1024
+
+// socketBufferSize is the requested SO_RCVBUF/SO_SNDBUF size for the tunnel
+// UDP sockets. Larger than the previous 64KB so a burst of packets has room
+// to sit in the kernel queue instead of being dropped while this process is
+// busy translating the previous one.
+const socketBufferSize = 4 * 1024 * 1024
 
 // Config
 type Configuration struct {
@@ -34,11 +42,9 @@ type Configuration struct {
 type GoProxyTunnel struct {
 	environment         env.EnvironmentManager
 	listenConnection    *net.UDPConn
-	incomingChannel     chan incomingMessage
-	connectionBuffer    map[string]*net.UDPConn
+	connectionBuffer    map[netip.AddrPort]*net.UDPConn
 	randseed            *rand.Rand
 	ifce                *water.Interface
-	outgoingChannel     chan outgoingMessage
 	finishChannel       chan bool
 	errorChannel        chan error
 	stopChannel         chan bool
@@ -51,202 +57,189 @@ type GoProxyTunnel struct {
 	localIP             net.IP
 	proxycache          *ProxyCache
 	TunnelPort          int
-	bufferPort          int
-	udpwrite            sync.RWMutex
-	tunwrite            sync.RWMutex
-	isListening         bool
+	// connectionBufferLock guards only connectionBuffer. net.UDPConn is
+	// itself safe for concurrent use, so nothing else needs to hold this
+	// while a packet is actually being written.
+	connectionBufferLock sync.RWMutex
+	isListening          bool
 }
 
-// incoming message from UDP channel
-type incomingMessage struct {
-	content *[]byte
-	from    net.UDPAddr
+// packetBufPool holds MTU-sized buffers for reading packets off the TUN
+// device and the UDP socket, so the read loops don't allocate one per
+// packet. Buffers are always pooled at full capacity and resliced by the
+// caller after a read.
+var packetBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, packetReadBufferSize)
+		return &b
+	},
 }
 
-// outgoing message from bridge
-type outgoingMessage struct {
-	content *[]byte
+func getPacketBuf() *[]byte {
+	return packetBufPool.Get().(*[]byte)
 }
 
-// handler function for all outgoing messages that are received by the TUN device
-func (proxy *GoProxyTunnel) outgoingMessage() {
-	for {
-		select {
-		case msg := <-proxy.outgoingChannel:
-			// logger.DebugLogger().Println("outgoingChannelSize: ", len(proxy.outgoingChannel))
-			// logger.DebugLogger().Printf("Msg outgoingChannel: %x\n", (*msg.content))
-			ip, prot := decodePacket(*msg.content)
-			if ip == nil {
-				continue
-			}
-			logger.DebugLogger().Printf("Outgoing packet:\t\t\t%s ---> %s\n", ip.GetSrcIP().String(), ip.GetDestIP().String())
+func putPacketBuf(b *[]byte) {
+	*b = (*b)[:cap(*b)]
+	packetBufPool.Put(b)
+}
 
-			// continue only if the packet is udp or tcp, otherwise just drop it
-			if prot == nil {
-				logger.DebugLogger().Println("Neither TCP, nor UDP packet received. Dropping it.")
-				continue
-			}
-			// proxyConversion
-			newPacket := proxy.outgoingProxy(ip, prot)
-			if newPacket == nil {
-				// if no proxy conversion available, drop it
-				logger.ErrorLogger().Println("Unable to convert the packet")
-				continue
-			}
+// handleOutgoing processes one packet read from the TUN device: translate it
+// (if it targets the semantic-routing subnetwork) and forward it on. buf is
+// only used for the duration of this call.
+func (proxy *GoProxyTunnel) handleOutgoing(buf []byte) {
+	pkt, ok := iputils.Parse(buf)
+	if !ok || !pkt.HasTransport() {
+		return
+	}
+	if logger.IsDebug() {
+		logger.DebugLogger().Printf("Outgoing packet:\t\t\t%s ---> %s\n", pkt.SrcIP(), pkt.DstIP())
+	}
 
-			// fetch remote address
-			dstHost, dstPort := proxy.locateRemoteAddress(ip.GetDestIP())
+	dstHost, dstPort, ok := proxy.outgoingProxy(&pkt)
+	if !ok {
+		return
+	}
+	proxy.forward(dstHost, dstPort, pkt.Bytes(), 0)
+}
 
-			// packetForwarding to tunnel interface
-			proxy.forward(dstHost, dstPort, newPacket, 0)
-		}
+// handleIngoing processes one packet received on the tunnel UDP socket (or
+// forwarded locally, see forward()): reverse-translate it if it matches an
+// outstanding flow, then write it to the TUN device. buf is only used for
+// the duration of this call.
+func (proxy *GoProxyTunnel) handleIngoing(buf []byte) {
+	pkt, ok := iputils.Parse(buf)
+	if !ok || !pkt.HasTransport() {
+		return
+	}
+	if logger.IsDebug() {
+		logger.DebugLogger().Printf("Ingoing packet:\t\t\t %s <--- %s\n", pkt.DstIP(), pkt.SrcIP())
+	}
+
+	// ingoingProxy returning false just means there's no reverse mapping for
+	// this flow - the packet is still forwarded to the TUN device unchanged.
+	proxy.ingoingProxy(&pkt)
+
+	if _, err := proxy.ifce.Write(pkt.Bytes()); err != nil {
+		logger.ErrorLogger().Println(err)
 	}
 }
 
-// handler function for all ingoing messages that are received by the UDP socket
-func (proxy *GoProxyTunnel) ingoingMessage() {
-	for {
-		select {
-		case msg := <-proxy.incomingChannel:
-			// logger.DebugLogger().Println("ingoingChannelSize: ", len(proxy.incomingChannel))
-			// logger.DebugLogger().Printf("Msg incomingChannel: %x\n", (*msg.content))
-			ip, prot := decodePacket(*msg.content)
+// outgoingProxy rewrites pkt in place if its destination falls in the
+// semantic-routing subnetwork, resolving the target instance via the
+// translation table (proxy.environment) and the per-flow ProxyCache. ok is
+// false if the packet isn't part of the proxy subnetwork, or its ServiceIP
+// can't currently be resolved - either way it should be dropped.
+func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, dstPort int, ok bool) {
+	dstIP := pkt.DstIP()
+	srcIP := pkt.SrcIP()
+	srcport := int(pkt.SrcPort())
+	dstport := int(pkt.DstPort())
 
-			// proceed only if this is a valid ip packet
-			if ip == nil {
-				continue
-			}
-			logger.DebugLogger().Printf("Ingoing packet:\t\t\t %s <--- %s\n", ip.GetDestIP().String(), ip.GetSrcIP().String())
-
-			// continue only if the packet is udp or tcp, otherwise just drop it
-			if prot == nil {
-				continue
-			}
-
-			// proxyConversion
-			newPacket := proxy.ingoingProxy(ip, prot)
-			var packetBytes []byte
-			if newPacket == nil {
-				// no conversion data, forward as is
-				packetBytes = *msg.content
-			} else {
-				packetBytes = packetToByte(newPacket)
-			}
-			// output to bridge interface
-			_, err := proxy.ifce.Write(packetBytes)
-			if err != nil {
-				logger.ErrorLogger().Println(err)
-			}
-		}
-	}
-}
-
-// If packet destination is in the range of proxy.ProxyIpSubnetwork
-// then find enable load balancing policy and find out the actual dstIP address
-func (proxy *GoProxyTunnel) outgoingProxy(ip iputils.NetworkLayerPacket, prot iputils.TransportLayerProtocol) gopacket.Packet {
-	dstIP := ip.GetDestIP()
-	srcIP := ip.GetSrcIP()
-	var semanticRoutingSubnetwork bool
-	srcport := -1
-	dstport := -1
-	if prot != nil {
-		srcport = int(prot.GetSourcePort())
-		dstport = int(prot.GetDestPort())
-	}
-
-	// If packet destination is part of the semantic routing subnetwork let the proxy handle it
-	if ip.GetProtocolVersion() == 4 {
-		semanticRoutingSubnetwork = proxy.ProxyIpSubnetwork.IP.Mask(proxy.ProxyIpSubnetwork.Mask).
-			Equal(ip.GetDestIP().Mask(proxy.ProxyIpSubnetwork.Mask))
-	}
-	if ip.GetProtocolVersion() == 6 {
-		semanticRoutingSubnetwork = proxy.ProxyIPv6Subnetwork.IP.Mask(proxy.ProxyIPv6Subnetwork.Mask).
-			Equal(ip.GetDestIP().Mask(proxy.ProxyIPv6Subnetwork.Mask))
-	}
-
-	if semanticRoutingSubnetwork {
-		// Check if the ServiceIP is known
-		tableEntryList := proxy.environment.GetTableEntryByServiceIP(dstIP)
-		if len(tableEntryList) < 1 {
-			return nil
-		}
-
-		// Find the instanceIP of the current service
-		instanceIP, err := proxy.convertToInstanceIp(ip)
-		if err != nil {
-			return nil
-		}
-
-		// Check proxy proxycache (if any active flow is there already)
-		entry, exist := proxy.proxycache.RetrieveByServiceIP(srcIP, instanceIP, srcport, dstIP, dstport)
-
-		if !exist || entry.dstport < 1 || !TableEntryCache.IsNamespaceStillValid(entry.dstip, &tableEntryList) {
-			// Choose between the table entry according to the ServiceIP algorithm
-			// TODO: so far this only uses RR, ServiceIP policies should be implemented here
-			tableEntry := tableEntryList[proxy.randseed.Intn(len(tableEntryList))]
-
-			entryDstIP := tableEntry.Nsipv6
-			if ip.GetProtocolVersion() == 4 {
-				entryDstIP = tableEntry.Nsip
-			}
-
-			// Update proxycache
-			entry = ConversionEntry{
-				srcip:         srcIP,
-				dstip:         entryDstIP,
-				dstServiceIp:  dstIP,
-				srcInstanceIp: instanceIP,
-				srcport:       srcport,
-				dstport:       dstport,
-			}
-			proxy.proxycache.Add(entry)
-		}
-		return ip.SerializePacket(entry.dstip, entry.srcInstanceIp, prot)
-	}
-	return nil
-}
-
-func (proxy *GoProxyTunnel) convertToInstanceIp(ip iputils.NetworkLayerPacket) (net.IP, error) {
-	instanceTableEntry, instanceexist := proxy.environment.GetTableEntryByNsIP(ip.GetSrcIP())
-	instanceIP := net.IP{}
-	if instanceexist {
-		for _, sip := range instanceTableEntry.ServiceIP {
-			if sip.IpType == TableEntryCache.InstanceNumber {
-				instanceIP = sip.Address_v6
-				if ip.GetProtocolVersion() == 4 {
-					instanceIP = sip.Address
-				}
-			}
-		}
+	var inProxySubnet bool
+	if pkt.Version() == 4 {
+		inProxySubnet = proxy.ProxyIpSubnetwork.Contains(netIPFromAddr(dstIP))
 	} else {
-		logger.ErrorLogger().Println("Unable to find instance IP for service: ", ip.GetSrcIP())
-		return nil, fmt.Errorf("unable to find instance IP for service: %s ", ip.GetSrcIP().String())
+		inProxySubnet = proxy.ProxyIPv6Subnetwork.Contains(netIPFromAddr(dstIP))
 	}
-	return instanceIP, nil
+	if !inProxySubnet {
+		return nil, 0, false
+	}
+
+	// Check if the ServiceIP is known
+	tableEntryList := proxy.environment.GetTableEntryByServiceIP(netIPFromAddr(dstIP))
+	if len(tableEntryList) < 1 {
+		return nil, 0, false
+	}
+
+	// Find the instanceIP of the current service
+	instanceIP, ok := proxy.convertToInstanceIp(pkt.Version(), srcIP)
+	if !ok {
+		return nil, 0, false
+	}
+
+	// Check proxy proxycache (if any active flow is there already)
+	entry, exist := proxy.proxycache.RetrieveByServiceIP(srcIP, instanceIP, srcport, dstIP, dstport)
+
+	if !exist || entry.dstport < 1 || !TableEntryCache.IsNamespaceStillValid(netIPFromAddr(entry.dstip), &tableEntryList) {
+		// Choose between the table entry according to the ServiceIP algorithm
+		// TODO: so far this only uses RR, ServiceIP policies should be implemented here
+		tableEntry := tableEntryList[proxy.randseed.Intn(len(tableEntryList))]
+
+		entryDstIPnet := tableEntry.Nsip
+		if pkt.Version() == 6 {
+			entryDstIPnet = tableEntry.Nsipv6
+		}
+		entryDstIP, ok := TableEntryCache.AddrFromIP(entryDstIPnet)
+		if !ok {
+			return nil, 0, false
+		}
+		nodeAddr, ok := TableEntryCache.AddrFromIP(tableEntry.Nodeip)
+		if !ok {
+			return nil, 0, false
+		}
+
+		// Update proxycache. dstNode/dstNodePort are cached here too - an
+		// Nsip is only ever valid on the node that handed it out, so as long
+		// as this cache entry (and its dstip) is still valid there's no need
+		// to look Nodeip/Nodeport back up by Nsip on every packet.
+		entry = ConversionEntry{
+			srcip:         srcIP,
+			dstip:         entryDstIP,
+			dstServiceIp:  dstIP,
+			srcInstanceIp: instanceIP,
+			srcport:       srcport,
+			dstport:       dstport,
+			dstNode:       nodeAddr,
+			dstNodePort:   tableEntry.Nodeport,
+		}
+		proxy.proxycache.Add(entry)
+	}
+
+	if !pkt.Rewrite(entry.srcInstanceIp, entry.dstip) {
+		return nil, 0, false
+	}
+	return netIPFromAddr(entry.dstNode), entry.dstNodePort, true
 }
 
-// If packet destination port is proxy.tunnelport then is a packet forwarded by the proxy. The src address must beù
-// changed with he original packet destination
-func (proxy *GoProxyTunnel) ingoingProxy(ip iputils.NetworkLayerPacket, prot iputils.TransportLayerProtocol) gopacket.Packet {
-	dstport := -1
-	srcport := -1
-
-	if prot != nil {
-		dstport = int(prot.GetDestPort())
-		srcport = int(prot.GetSourcePort())
+// convertToInstanceIp resolves the stable "instance IP" that identifies
+// srcIP's own service instance, for use as the translated source address.
+func (proxy *GoProxyTunnel) convertToInstanceIp(version uint8, srcIP netip.Addr) (netip.Addr, bool) {
+	instanceTableEntry, instanceexist := proxy.environment.GetTableEntryByNsIP(netIPFromAddr(srcIP))
+	if !instanceexist {
+		logger.ErrorLogger().Println("Unable to find instance IP for service: ", srcIP)
+		return netip.Addr{}, false
 	}
+	for _, sip := range instanceTableEntry.ServiceIP {
+		if sip.IpType != TableEntryCache.InstanceNumber {
+			continue
+		}
+		instanceIPnet := sip.Address
+		if version == 6 {
+			instanceIPnet = sip.Address_v6
+		}
+		return TableEntryCache.AddrFromIP(instanceIPnet)
+	}
+	return netip.Addr{}, false
+}
+
+// ingoingProxy checks the ProxyCache for a reverse mapping (a flow this node
+// itself originated via outgoingProxy) and, if found, rewrites pkt in place
+// back to its original semantic addressing. Returns false (no-op) if there
+// is no such mapping - the packet is then forwarded unchanged.
+func (proxy *GoProxyTunnel) ingoingProxy(pkt *iputils.Packet) bool {
+	dstport := int(pkt.DstPort())
+	srcport := int(pkt.SrcPort())
 
 	// Check proxy proxycache for REVERSE entry conversion
 	// DstIP -> srcip, DstPort->srcport, srcport -> dstport
-	entry, exist := proxy.proxycache.RetrieveByInstanceIp(ip.GetDestIP(), dstport, srcport)
-
+	entry, exist := proxy.proxycache.RetrieveByInstanceIp(pkt.DstIP(), dstport, srcport)
 	if !exist {
-		// No proxy proxycache entry, no translation needed
-		return nil
+		return false
 	}
 
 	// Reverse conversion
-	return ip.SerializePacket(entry.srcip, entry.dstServiceIp, prot)
+	return pkt.Rewrite(entry.dstServiceIp, entry.srcip)
 }
 
 // Enable listening to outgoing packets
@@ -256,11 +249,8 @@ func (proxy *GoProxyTunnel) ingoingProxy(ip iputils.NetworkLayerPacket, prot ipu
 func (proxy *GoProxyTunnel) tunOutgoingListen() {
 	readerror := make(chan error)
 
-	// async listener
-	go proxy.ifaceread(proxy.ifce, proxy.outgoingChannel, readerror)
-
-	// async handler
-	go proxy.outgoingMessage()
+	// async reader+processor
+	go proxy.outgoingLoop(readerror)
 
 	proxy.isListening = true
 	logger.InfoLogger().Println("GoProxyTunnel outgoing listening started")
@@ -286,11 +276,8 @@ func (proxy *GoProxyTunnel) tunOutgoingListen() {
 func (proxy *GoProxyTunnel) tunIngoingListen() {
 	readerror := make(chan error)
 
-	// async listener
-	go proxy.udpread(proxy.listenConnection, proxy.incomingChannel, readerror)
-
-	// async handler
-	go proxy.ingoingMessage()
+	// async reader+processor
+	go proxy.ingoingLoop(readerror)
 
 	proxy.isListening = true
 	logger.InfoLogger().Println("GoProxyTunnel ingoing listening started")
@@ -306,157 +293,112 @@ func (proxy *GoProxyTunnel) tunIngoingListen() {
 			}
 		case errormsg := <-readerror:
 			proxy.errorChannel <- errormsg
-			// go udpread(proxy.listenConnection, readoutput, readerror)
 		}
 	}
 }
 
-// Given a network namespace IP find the machine IP and port for the tunneling
-func (proxy *GoProxyTunnel) locateRemoteAddress(nsIP net.IP) (net.IP, int) {
-	// if no local cache entry convert namespace IP to host IP via table query
-	tableElement, found := proxy.environment.GetTableEntryByNsIP(nsIP)
-	if found {
-		logger.DebugLogger().Println("Remote NS IP", nsIP.String(), " translated to ", tableElement.Nodeip.String())
-		return tableElement.Nodeip, tableElement.Nodeport
+// outgoingLoop reads packets from the TUN device and processes them
+// synchronously, one at a time, reusing a pooled buffer for each read.
+func (proxy *GoProxyTunnel) outgoingLoop(errchannel chan<- error) {
+	for {
+		buf := getPacketBuf()
+		n, err := proxy.ifce.Read(*buf)
+		if err != nil {
+			putPacketBuf(buf)
+			errchannel <- err
+			continue
+		}
+		proxy.handleOutgoing((*buf)[:n])
+		putPacketBuf(buf)
 	}
-
-	// If nothing found, just drop the packet using an invalid port
-	return nsIP, -1
 }
 
-// forward message to final destination via UDP tunneling
-func (proxy *GoProxyTunnel) forward(dstHost net.IP, dstPort int, packet gopacket.Packet, attemptNumber int) {
+// ingoingLoop reads packets from the tunnel UDP socket and processes them
+// synchronously, one at a time, reusing a pooled buffer for each read.
+func (proxy *GoProxyTunnel) ingoingLoop(errchannel chan<- error) {
+	for {
+		buf := getPacketBuf()
+		n, _, err := proxy.listenConnection.ReadFromUDP(*buf)
+		if err != nil {
+			putPacketBuf(buf)
+			errchannel <- err
+			continue
+		}
+		proxy.handleIngoing((*buf)[:n])
+		putPacketBuf(buf)
+	}
+}
+
+// forward sends packetBytes to dstHost:dstPort over the tunnel, or - if the
+// destination is this machine - hands it straight to the ingoing pipeline
+// without going over the network at all.
+func (proxy *GoProxyTunnel) forward(dstHost net.IP, dstPort int, packetBytes []byte, attemptNumber int) {
 	if attemptNumber > 10 {
 		return
 	}
 
-	packetBytes := packetToByte(packet)
-
 	// If destination host is this machine, forward packet directly to the ingoing traffic method
 	if dstHost.Equal(proxy.localIP) {
-		logger.InfoLogger().Println("Packet forwarded locally")
-		msg := incomingMessage{
-			from: net.UDPAddr{
-				IP:   proxy.localIP,
-				Port: 0,
-				Zone: "",
-			},
-			content: &packetBytes,
+		if logger.IsDebug() {
+			logger.DebugLogger().Println("Packet forwarded locally")
 		}
-		proxy.incomingChannel <- msg
+		proxy.handleIngoing(packetBytes)
 		return
 	}
 
-	// Check udp channel buffer to avoid creating a new channel
-	proxy.udpwrite.Lock()
-	hoststring := fmt.Sprintf("%s:%v", dstHost, dstPort)
-	con, exist := proxy.connectionBuffer[hoststring]
-	proxy.udpwrite.Unlock()
-	// TODO: flush connection buffer by time to time
+	addr, ok := TableEntryCache.AddrFromIP(dstHost)
+	if !ok {
+		logger.ErrorLogger().Println("Invalid destination host:", dstHost)
+		return
+	}
+	key := netip.AddrPortFrom(addr, uint16(dstPort))
+
+	proxy.connectionBufferLock.RLock()
+	con, exist := proxy.connectionBuffer[key]
+	proxy.connectionBufferLock.RUnlock()
+
 	if !exist {
-		logger.DebugLogger().Println("Establishing a new connection to node ", hoststring)
-		connection, err := createUDPChannel(hoststring)
+		connection, err := createUDPChannel(key)
 		if nil != err {
 			return
 		}
-		_ = connection.SetWriteBuffer(BUFFER_SIZE)
-		proxy.udpwrite.Lock()
-		proxy.connectionBuffer[hoststring] = connection
-		proxy.udpwrite.Unlock()
+		proxy.connectionBufferLock.Lock()
+		proxy.connectionBuffer[key] = connection
+		proxy.connectionBufferLock.Unlock()
 		con = connection
 	}
 
-	// send via UDP channel
-	proxy.udpwrite.Lock()
-	_, _, err := (*con).WriteMsgUDP(packetBytes, nil, nil)
-	proxy.udpwrite.Unlock()
+	// net.UDPConn is safe for concurrent use - no lock needed around the
+	// write itself, only around the map lookup above.
+	_, err := con.Write(packetBytes)
 	if err != nil {
-		_ = (*con).Close()
+		_ = con.Close()
 		logger.ErrorLogger().Println(err)
-		connection, err := createUDPChannel(hoststring)
+		connection, err := createUDPChannel(key)
 		if nil != err {
 			return
 		}
-		proxy.udpwrite.Lock()
-		proxy.connectionBuffer[hoststring] = connection
-		proxy.udpwrite.Unlock()
+		proxy.connectionBufferLock.Lock()
+		proxy.connectionBuffer[key] = connection
+		proxy.connectionBufferLock.Unlock()
 		// Try again
-		attemptNumber++
-		proxy.forward(dstHost, dstPort, packet, attemptNumber)
+		proxy.forward(dstHost, dstPort, packetBytes, attemptNumber+1)
 	}
 }
 
-func createUDPChannel(hoststring string) (*net.UDPConn, error) {
-	raddr, err := net.ResolveUDPAddr("udp", hoststring)
-	if err != nil {
-		logger.ErrorLogger().Println("Unable to resolve remote addr:", err)
-		return nil, err
-	}
-	connection, err := net.DialUDP("udp", nil, raddr)
+func createUDPChannel(raddr netip.AddrPort) (*net.UDPConn, error) {
+	connection, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(raddr))
 	if nil != err {
 		logger.ErrorLogger().Println("Unable to connect to remote addr:", err)
 		return nil, err
 	}
-	err = connection.SetWriteBuffer(BUFFER_SIZE)
+	err = connection.SetWriteBuffer(socketBufferSize)
 	if nil != err {
-		logger.ErrorLogger().Println("Buffer error:", err)
-		return nil, err
+		// Not fatal: the socket still works with whatever the kernel's
+		// default/clamped size is, just more prone to drops under bursts.
+		logger.ErrorLogger().Println("Unable to grow UDP write buffer:", err)
 	}
 	return connection, nil
-}
-
-// read output from an interface and wrap the read operation with a channel
-// out channel gives back the byte array of the output
-// errchannel is the channel where in case of error the error is routed
-func (proxy *GoProxyTunnel) ifaceread(ifce *water.Interface, out chan<- outgoingMessage, errchannel chan<- error) {
-	buffer := make([]byte, BUFFER_SIZE)
-	for {
-		n, err := ifce.Read(buffer)
-		if err != nil {
-			errchannel <- err
-		} else {
-			res := make([]byte, n)
-			copy(res, buffer[:n])
-			logger.DebugLogger().Printf("Outgoing packet ready for decode action \n")
-			out <- outgoingMessage{
-				content: &res,
-			}
-		}
-	}
-}
-
-// read output from an UDP connection and wrap the read operation with a channel
-// out channel gives back the byte array of the output
-// errchannel is the channel where in case of error the error is routed
-func (proxy *GoProxyTunnel) udpread(conn *net.UDPConn, out chan<- incomingMessage, errchannel chan<- error) {
-	buffer := make([]byte, BUFFER_SIZE)
-	for {
-		packet := buffer
-		n, from, err := conn.ReadFromUDP(packet)
-		if err != nil {
-			errchannel <- err
-		} else {
-			res := make([]byte, n)
-			copy(res, buffer[:n])
-			out <- incomingMessage{
-				from:    *from,
-				content: &res,
-			}
-		}
-	}
-}
-
-func packetToByte(packet gopacket.Packet) []byte {
-	options := gopacket.SerializeOptions{
-		ComputeChecksums: false,
-		FixLengths:       true,
-	}
-	newBuffer := gopacket.NewSerializeBuffer()
-	err := gopacket.SerializePacket(newBuffer, options, packet)
-	if err != nil {
-		logger.ErrorLogger().Println(err)
-	}
-	return newBuffer.Bytes()
 }
 
 // GetName returns the name of the tun interface
@@ -481,39 +423,13 @@ func (proxy *GoProxyTunnel) GetFinishCh() <-chan bool {
 	return proxy.finishChannel
 }
 
-func decodePacket(msg []byte) (iputils.NetworkLayerPacket, iputils.TransportLayerProtocol) {
-	var ipType layers.IPProtocol
-	switch msg[0] & 0xf0 {
-	case 0x40:
-		ipType = layers.IPProtocolIPv4
-	case 0x60:
-		ipType = layers.IPProtocolIPv6
-	default:
-		logger.DebugLogger().Println("Was neither IPv4 Packet, nor IPv6 packet.")
-		return nil, nil
+// netIPFromAddr converts a netip.Addr to a net.IP in its 16-byte form, which
+// net.IP.Equal/net.IPNet.Contains compare correctly regardless of whether
+// the other side is a 4-byte or 16-byte representation of the same address.
+func netIPFromAddr(addr netip.Addr) net.IP {
+	if !addr.IsValid() {
+		return nil
 	}
-
-	packet := iputils.NewGoPacket(msg, ipType)
-	if packet == nil {
-		logger.DebugLogger().Println("Error decoding Network Layer of Packet")
-	}
-
-	ipLayer := packet.NetworkLayer()
-	if ipLayer == nil {
-		logger.ErrorLogger().Println("Network Layer could not have been decoded.")
-		return nil, nil
-	}
-
-	res := iputils.NewNetworkLayerPacket(ipType, ipLayer)
-	if ipType == layers.IPProtocolIPv6 {
-		res.DecodeNetworkLayer(packet)
-	}
-
-	err := res.Defragment()
-	if err != nil {
-		logger.ErrorLogger().Println("Error in defragmentation")
-		return nil, nil
-	}
-
-	return res, res.GetTransportLayer()
+	b := addr.As16()
+	return net.IP(b[:])
 }
