@@ -1,9 +1,8 @@
 package proxy
 
 import (
-	"NetManager/env"
 	"NetManager/logger"
-	"NetManager/network"
+	"NetManager/resolver"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,13 +10,13 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
-	"strconv"
 
-	"github.com/songgao/water"
+	"golang.zx2c4.com/wireguard/tun"
 )
 
-// create a  new GoProxyTunnel with the configuration from the custom local file
-func New() *GoProxyTunnel {
+// create a new Tunnel with the configuration from the custom local file. localIP is the
+// host address to source tunnel traffic from - discovering it is host-specific and left to the caller.
+func New(localIP netip.Addr) *Tunnel {
 	// load netcfg.json
 	cfg, err := os.Open("/etc/netmanager/tuncfg.json")
 	if err != nil {
@@ -44,47 +43,40 @@ func New() *GoProxyTunnel {
 	}
 
 	logger.InfoLogger().Printf("Utilizing config: %v", defaultconfig)
-	return NewCustom(defaultconfig)
+	return NewCustom(defaultconfig, localIP)
 }
 
-// create a  new GoProxyTunnel with a custom configuration
-func NewCustom(configuration Configuration) *GoProxyTunnel {
-	proxy := GoProxyTunnel{
+// create a new Tunnel with a custom configuration
+func NewCustom(configuration Configuration, localIP netip.Addr) *Tunnel {
+	tunnel := Tunnel{
 		isListening:      false,
 		errorChannel:     make(chan error),
 		finishChannel:    make(chan bool),
 		stopChannel:      make(chan bool),
 		connectionBuffer: make(map[netip.AddrPort]*tunnelConn),
-		proxycache:       NewProxyCache(),
-		mtusize:          strconv.Itoa(configuration.Mtusize),
+		mtu:              configuration.Mtusize,
 	}
 
 	// parse configuration file
 	tunconfig := configuration
-	proxy.HostTUNDeviceName = tunconfig.HostTUNDeviceName
-	proxy.ProxyIPv4Prefix = maskedPrefix(tunconfig.ProxySubnetwork, maskBits(tunconfig.ProxySubnetworkMask))
-	proxy.TunnelPort = tunconfig.TunnelPort
-	proxy.tunNetIP = tunconfig.TunNetIP
+	tunnel.HostTUNDeviceName = tunconfig.HostTUNDeviceName
+	tunnel.TunnelPort = tunconfig.TunnelPort
+	tunnel.tunNetIP = tunconfig.TunNetIP
+	tunnel.tunNetIPv6 = tunconfig.TunNetIPv6
 
-	proxy.ProxyIPv6Prefix = maskedPrefix(tunconfig.ProxySubnetworkIPv6, tunconfig.ProxySubnetworkIPv6Prefix)
-	proxy.tunNetIPv6 = tunconfig.TunNetIPv6
+	v4Prefix := maskedPrefix(tunconfig.ProxySubnetwork, maskBits(tunconfig.ProxySubnetworkMask))
+	v6Prefix := maskedPrefix(tunconfig.ProxySubnetworkIPv6, tunconfig.ProxySubnetworkIPv6Prefix)
+	tunnel.dp = NewDatapath(nil, localIP.Unmap(), v4Prefix, v6Prefix, &tunnel)
+
 	// create the TUN device
-	proxy.createTun()
+	tunnel.createTun()
 
-	// set local ip
-	ipstring, _ := network.GetLocalIPandIface()
-	localAddr, err := netip.ParseAddr(ipstring)
-	if err != nil {
-		log.Fatalf("Unable to parse the local IP %q: %s", ipstring, err)
-	}
-	proxy.localIP = localAddr.Unmap()
+	tunnel.startConnectionEviction()
 
-	proxy.startConnectionEviction()
+	logger.InfoLogger().Printf("Created ProxyTun device: %s\n", tunnel.tun.Name())
+	logger.InfoLogger().Printf("Local Ip detected: %s\n", tunnel.dp.localIP.String())
 
-	logger.InfoLogger().Printf("Created ProxyTun device: %s\n", proxy.ifce.Name())
-	logger.InfoLogger().Printf("Local Ip detected: %s\n", proxy.localIP.String())
-
-	return &proxy
+	return &tunnel
 }
 
 // maskBits converts a dotted-quad netmask from the config file into a prefix
@@ -114,49 +106,51 @@ func maskedPrefix(address string, bits int) netip.Prefix {
 	return prefix
 }
 
-func (proxy *GoProxyTunnel) SetEnvironment(env env.EnvironmentManager) {
-	proxy.environment = env
+func (t *Tunnel) SetResolver(r resolver.Resolver) {
+	t.dp.SetResolver(r)
 }
 
-func (proxy *GoProxyTunnel) IsListening() bool {
-	return proxy.isListening
+func (t *Tunnel) IsListening() bool {
+	return t.isListening
 }
 
 // start listening for packets in the TUN Proxy device
-func (proxy *GoProxyTunnel) Listen() {
-	if !proxy.isListening {
+func (t *Tunnel) Listen() {
+	if !t.isListening {
 		logger.InfoLogger().Println("Starting proxy listening mode")
-		go proxy.tunOutgoingListen()
-		go proxy.tunIngoingListen()
+		go t.tunOutgoingListen()
+		go t.tunIngoingListen()
 	}
 }
 
 // create an instance of the proxy TUN device and setup the environment
-func (proxy *GoProxyTunnel) createTun() {
-	//create tun device
-	config := water.Config{
-		DeviceType: water.TUN,
-	}
-	config.Name = proxy.HostTUNDeviceName
-	ifce, err := water.New(config)
+func (t *Tunnel) createTun() {
+	// CreateTUN both creates the device and sets its MTU, so there is no
+	// separate "ip link set mtu" step below the way there used to be with
+	// water.
+	dev, err := tun.CreateTUN(t.HostTUNDeviceName, t.mtu)
 	if err != nil {
 		log.Fatalf("Unable to create new TUN/TAP interface: %s", err)
 	}
+	name, err := dev.Name()
+	if err != nil {
+		log.Fatalf("Unable to read TUN/TAP interface name: %s", err)
+	}
 
-	logger.InfoLogger().Println("Bringing tun up with addr " + proxy.tunNetIP + "/12")
-	cmd := exec.Command("ip", "addr", "add", proxy.tunNetIP+"/12", "dev", ifce.Name())
+	logger.InfoLogger().Println("Bringing tun up with addr " + t.tunNetIP + "/12")
+	cmd := exec.Command("ip", "addr", "add", t.tunNetIP+"/12", "dev", name)
 	logger.InfoLogger().Println()
 	err = cmd.Run()
 	if err != nil {
 		log.Fatal(err)
 	}
-	logger.InfoLogger().Println("Bringing tun up with IPv6 addr " + proxy.tunNetIPv6 + "/7")
-	cmd = exec.Command("ip", "addr", "add", proxy.tunNetIPv6+"/7", "dev", ifce.Name())
+	logger.InfoLogger().Println("Bringing tun up with IPv6 addr " + t.tunNetIPv6 + "/7")
+	cmd = exec.Command("ip", "addr", "add", t.tunNetIPv6+"/7", "dev", name)
 	err = cmd.Run()
 	if err != nil {
 		log.Fatal(err)
 	}
-	cmd = exec.Command("ip", "link", "set", "dev", ifce.Name(), "up")
+	cmd = exec.Command("ip", "link", "set", "dev", name, "up")
 	err = cmd.Run()
 	if err != nil {
 		log.Fatal(err)
@@ -164,32 +158,24 @@ func (proxy *GoProxyTunnel) createTun() {
 
 	//disabling reverse path filtering
 	logger.InfoLogger().Println("Disabling tun dev reverse path filtering")
-	cmd = exec.Command("echo", "0", ">", "/proc/sys/net/ipv4/conf/"+ifce.Name()+"/rp_filter")
+	cmd = exec.Command("echo", "0", ">", "/proc/sys/net/ipv4/conf/"+name+"/rp_filter")
 	err = cmd.Run()
 	if err != nil {
 		log.Printf("Error disabling tun dev reverse path filtering: %s ", err.Error())
 	}
 
-	//Increasing the MTU on the TUN dev
-	logger.InfoLogger().Println("Changing TUN's MTU")
-	cmd = exec.Command("ip", "link", "set", "dev", ifce.Name(), "mtu", proxy.mtusize)
-	err = cmd.Run()
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
 	//Add network routing rule, Done by default by the system
-	logger.InfoLogger().Printf("adding routing rule for %s to %s\n", proxy.ProxyIPv4Prefix.String(), ifce.Name())
-	cmd = exec.Command("ip", "route", "add", "10.30.0.0/12", "dev", ifce.Name())
+	logger.InfoLogger().Printf("adding routing rule for %s to %s\n", t.dp.ProxyIPv4Prefix.String(), name)
+	cmd = exec.Command("ip", "route", "add", "10.30.0.0/12", "dev", name)
 	_, _ = cmd.Output()
 
 	//Add network routing rule, Done by default by the system
-	logger.InfoLogger().Printf("adding routing rule for %s to %s\n", proxy.ProxyIPv6Prefix.String(), ifce.Name())
-	cmd = exec.Command("ip", "route", "add", proxy.ProxyIPv6Prefix.String(), "dev", ifce.Name())
+	logger.InfoLogger().Printf("adding routing rule for %s to %s\n", t.dp.ProxyIPv6Prefix.String(), name)
+	cmd = exec.Command("ip", "route", "add", t.dp.ProxyIPv6Prefix.String(), "dev", name)
 	_, _ = cmd.Output()
 
 	//add firewalls rules
-	logger.InfoLogger().Println("adding firewall rule " + ifce.Name())
+	logger.InfoLogger().Println("adding firewall rule " + name)
 	cmd = exec.Command("iptables", "-A", "INPUT", "-i", "tun0", "-m", "state",
 		"--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 	err = cmd.Run()
@@ -205,7 +191,7 @@ func (proxy *GoProxyTunnel) createTun() {
 	}
 
 	// listen to local socket
-	lstnAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%v", proxy.TunnelPort))
+	lstnAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%v", t.TunnelPort))
 	if nil != err {
 		log.Fatal("Unable to get UDP socket:", err)
 	}
@@ -220,9 +206,9 @@ func (proxy *GoProxyTunnel) createTun() {
 		logger.ErrorLogger().Println("Unable to grow UDP read buffer:", err)
 	}
 
-	proxy.HostTUNDeviceName = ifce.Name()
-	proxy.ifce = ifce
-	proxy.listenConnection = lstnConn
+	t.HostTUNDeviceName = name
+	t.tun = newWgTunDevice(dev)
+	t.sock = newUDPTunnelSocket(lstnConn)
 }
 
 // Configuration implements Stringer interface

@@ -1,4 +1,4 @@
-package env
+package resolver
 
 import (
 	"NetManager/TableEntryCache"
@@ -56,28 +56,28 @@ func TestUnresolvedQueryIsAFailure(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			env := &Environment{
+			r := &ServiceResolver{
 				translationTable: TableEntryCache.NewTableManager(),
 				tableQuery:       query,
 			}
 
-			if err := env.resolveServiceIP(addr); err == nil {
+			if err := r.resolveServiceIP(addr); err == nil {
 				t.Fatal("resolveServiceIP reported success for an address it did not resolve")
 			}
 
 			// The failure has to reach the negative cache, or the address is
 			// re-queried on every packet.
-			<-env.resolveServiceIPOnce(addr)
-			env.resolveLock.Lock()
-			_, remembered := env.failedServiceIPs[addr]
-			env.resolveLock.Unlock()
+			<-r.resolveServiceIPOnce(addr)
+			r.resolveLock.Lock()
+			_, remembered := r.failedServiceIPs[addr]
+			r.resolveLock.Unlock()
 			if !remembered {
 				t.Error("the failed resolution was not recorded in the negative cache")
 			}
 
 			// And a following packet must be turned away rather than starting
 			// a second query.
-			if again := env.resolveServiceIPOnce(addr); again != nil {
+			if again := r.resolveServiceIPOnce(addr); again != nil {
 				t.Error("a second resolution was started inside the negative-cache TTL")
 			}
 		})
@@ -88,23 +88,23 @@ func TestUnresolvedQueryIsAFailure(t *testing.T) {
 // past, the address gets another chance.
 func TestNegativeCacheExpires(t *testing.T) {
 	addr := netip.MustParseAddr("10.30.9.9")
-	env := &Environment{
+	r := &ServiceResolver{
 		translationTable: TableEntryCache.NewTableManager(),
 		tableQuery: func(netip.Addr) ([]TableEntryCache.TableEntry, error) {
 			return nil, errors.New("mqtt timeout")
 		},
 	}
 
-	<-env.resolveServiceIPOnce(addr)
-	if env.resolveServiceIPOnce(addr) != nil {
+	<-r.resolveServiceIPOnce(addr)
+	if r.resolveServiceIPOnce(addr) != nil {
 		t.Fatal("expected the negative cache to suppress an immediate retry")
 	}
 
-	env.resolveLock.Lock()
-	env.failedServiceIPs[addr] = time.Now().Add(-2 * negativeResolveCacheTTL)
-	env.resolveLock.Unlock()
+	r.resolveLock.Lock()
+	r.failedServiceIPs[addr] = time.Now().Add(-2 * negativeResolveCacheTTL)
+	r.resolveLock.Unlock()
 
-	done := env.resolveServiceIPOnce(addr)
+	done := r.resolveServiceIPOnce(addr)
 	if done == nil {
 		t.Fatal("expected a retry once the negative-cache TTL had passed")
 	}
@@ -122,7 +122,7 @@ func TestWrongAddressResponseLeavesTableUntouched(t *testing.T) {
 	// response will claim.
 	good := resolvableEntry("goodjob", "10.30.1.1")
 
-	env := &Environment{
+	r := &ServiceResolver{
 		translationTable: TableEntryCache.NewTableManager(),
 		tableQuery: func(netip.Addr) ([]TableEntryCache.TableEntry, error) {
 			// structurally valid, for a different job, and answering for a
@@ -130,21 +130,21 @@ func TestWrongAddressResponseLeavesTableUntouched(t *testing.T) {
 			return []TableEntryCache.TableEntry{resolvableEntry("otherjob", "10.30.2.2")}, nil
 		},
 	}
-	if err := env.translationTable.Add(good); err != nil {
+	if err := r.translationTable.Add(good); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := env.resolveServiceIP(netip.MustParseAddr(wantedVIP)); err == nil {
+	if err := r.resolveServiceIP(netip.MustParseAddr(wantedVIP)); err == nil {
 		t.Fatal("expected an error for a response that does not resolve the requested address")
 	}
 
-	if got := len(env.translationTable.SearchByJobName("goodjob")); got != 1 {
+	if got := len(r.translationTable.SearchByJobName("goodjob")); got != 1 {
 		t.Errorf("the rejected response displaced the existing route: goodjob has %d entries, want 1", got)
 	}
-	if got := len(env.translationTable.SearchByJobName("otherjob")); got != 0 {
+	if got := len(r.translationTable.SearchByJobName("otherjob")); got != 0 {
 		t.Errorf("the rejected response was installed anyway: otherjob has %d entries, want 0", got)
 	}
-	if entries, _ := env.translationTable.SearchByServiceIP(netip.MustParseAddr("10.30.1.1")); len(entries) != 1 {
+	if entries, _ := r.translationTable.SearchByServiceIP(netip.MustParseAddr("10.30.1.1")); len(entries) != 1 {
 		t.Errorf("the existing route is no longer resolvable: %d entries", len(entries))
 	}
 }
@@ -153,7 +153,7 @@ func TestWrongAddressResponseLeavesTableUntouched(t *testing.T) {
 // single JobName), so a response that mixes jobs is malformed and must be
 // rejected rather than half-installed under the first entry's name.
 func TestMixedJobResponseRejected(t *testing.T) {
-	env := &Environment{
+	r := &ServiceResolver{
 		translationTable: TableEntryCache.NewTableManager(),
 		tableQuery: func(netip.Addr) ([]TableEntryCache.TableEntry, error) {
 			first := resolvableEntry("jobone", "10.30.9.9")
@@ -163,10 +163,10 @@ func TestMixedJobResponseRejected(t *testing.T) {
 		},
 	}
 
-	if err := env.resolveServiceIP(netip.MustParseAddr("10.30.9.9")); err == nil {
+	if err := r.resolveServiceIP(netip.MustParseAddr("10.30.9.9")); err == nil {
 		t.Fatal("expected an error for a response mixing job names")
 	}
-	if got := len(env.translationTable.SearchByJobName("jobone")); got != 0 {
+	if got := len(r.translationTable.SearchByJobName("jobone")); got != 0 {
 		t.Errorf("a malformed response was partially installed: jobone has %d entries", got)
 	}
 }

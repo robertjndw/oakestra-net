@@ -1,4 +1,4 @@
-package env
+package resolver
 
 import (
 	"NetManager/TableEntryCache"

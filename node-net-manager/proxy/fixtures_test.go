@@ -2,10 +2,11 @@ package proxy
 
 import (
 	"NetManager/TableEntryCache"
-	"NetManager/env"
+	"NetManager/resolver"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 )
 
 // The fixture topology used by the proxy tests. Two nodes, each running a
-// GoProxyTunnel over a shared (globally consistent) translation table, which
+// Datapath over a shared (globally consistent) translation table, which
 // is what makes a full request/response round trip reproducible in-process:
 //
 //	node A (10.0.0.1)                     node B (10.0.0.2)
@@ -50,6 +51,12 @@ const (
 	otherVIPv6    = "fdff:2000::fb"
 
 	tunnelPort = 50103
+)
+
+// the fixture proxy prefixes, shared by every Datapath/Tunnel built for tests.
+var (
+	fixtureIPv4Prefix = netip.MustParsePrefix("10.30.0.0/16")
+	fixtureIPv6Prefix = netip.MustParsePrefix("fdff::/16")
 )
 
 // fixtureEntries is built once and shared by every test and benchmark. The
@@ -101,9 +108,9 @@ func newFakeEnv(entries ...TableEntryCache.TableEntry) *FakeEnv {
 	return e
 }
 
-func (fakeenv *FakeEnv) GetTableEntryByServiceIP(addr netip.Addr) env.ServiceLookup {
+func (fakeenv *FakeEnv) GetTableEntryByServiceIP(addr netip.Addr) resolver.ServiceLookup {
 	entries, generation := fakeenv.table.SearchByServiceIP(addr)
-	return env.ServiceLookup{Entries: entries, Generation: generation}
+	return resolver.ServiceLookup{Entries: entries, Generation: generation}
 }
 
 func (fakeenv *FakeEnv) GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool) {
@@ -122,27 +129,66 @@ func (fakeenv *FakeEnv) replaceJob(t testing.TB, job string, entries ...TableEnt
 	}
 }
 
-// getFakeTunnel returns a tunnel standing in for node A.
-func getFakeTunnel() *GoProxyTunnel {
+// discardSink is a Sink that throws away every Action it is given, for tests
+// that never trigger the replay goroutine (i.e. never hit a cold miss).
+type discardSink struct{}
+
+func (discardSink) Emit(Action) {}
+
+// recordingSink records every Action Emit is called with, in order - stands
+// in for a Tunnel in tests that only care about what the replay goroutine
+// (see Datapath.replayWhenResolved) decided, not about actual socket I/O.
+type recordingSink struct {
+	mu      sync.Mutex
+	actions []Action
+}
+
+func (s *recordingSink) Emit(a Action) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.actions = append(s.actions, a)
+}
+
+// drain returns everything recorded so far and resets the recording.
+func (s *recordingSink) drain() []Action {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.actions
+	s.actions = nil
+	return out
+}
+
+// getFakeDatapath returns a Datapath standing in for node A.
+func getFakeDatapath() *Datapath {
+	return fakeDatapathOn(nodeAIP, newFakeEnv())
+}
+
+// fakeDatapathOn returns a Datapath standing in for the node at localIP,
+// answering table lookups from env.
+func fakeDatapathOn(localIP string, env resolver.Resolver) *Datapath {
+	return NewDatapath(env, mustAddr(localIP), fixtureIPv4Prefix, fixtureIPv6Prefix, discardSink{})
+}
+
+// getFakeTunnel returns a Tunnel standing in for node A. Prefer
+// getFakeDatapath for tests that only exercise translation logic; this is
+// for tests that need real socket I/O (see loopbackTunnel) or the
+// connection pool.
+func getFakeTunnel() *Tunnel {
 	return fakeTunnelOn(nodeAIP)
 }
 
-func fakeTunnelOn(localIP string) *GoProxyTunnel {
-	tunnel := &GoProxyTunnel{
+func fakeTunnelOn(localIP string) *Tunnel {
+	tunnel := &Tunnel{
 		tunNetIP:          "10.19.1.254",
-		ifce:              nil,
+		tun:               nil,
 		isListening:       true,
-		ProxyIPv4Prefix:   netip.MustParsePrefix("10.30.0.0/16"),
 		HostTUNDeviceName: "goProxyTun",
 		TunnelPort:        tunnelPort,
-		listenConnection:  nil,
-		proxycache:        NewProxyCache(),
+		sock:              nil,
 		tunNetIPv6:        "fdfe::1337",
-		ProxyIPv6Prefix:   netip.MustParsePrefix("fdff::/16"),
 		connectionBuffer:  make(map[netip.AddrPort]*tunnelConn),
-		localIP:           netip.MustParseAddr(localIP),
 	}
-	tunnel.SetEnvironment(newFakeEnv())
+	tunnel.dp = NewDatapath(newFakeEnv(), mustAddr(localIP), fixtureIPv4Prefix, fixtureIPv6Prefix, tunnel)
 	return tunnel
 }
 
@@ -223,11 +269,11 @@ func serialize(t testing.TB, ls ...gopacket.SerializableLayer) []byte {
 
 func mustAddr(s string) netip.Addr { return netip.MustParseAddr(s) }
 
-// loopbackTunnel returns a tunnel whose target service resolves to a real UDP
-// socket on loopback, so tests can drive the complete handleOutgoing path -
-// translation, fragment state and the actual forward - and read back exactly
-// what went on the wire.
-func loopbackTunnel(t testing.TB) (*GoProxyTunnel, *net.UDPConn) {
+// loopbackTunnel returns a Tunnel whose target service resolves to a real UDP
+// socket on loopback, so tests can drive the complete outgoing path -
+// translation, fragment state and an actual forward over the wire - through
+// Tunnel.Emit and read back exactly what went on the wire.
+func loopbackTunnel(t testing.TB) (*Tunnel, *net.UDPConn) {
 	t.Helper()
 	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
@@ -240,12 +286,12 @@ func loopbackTunnel(t testing.TB) (*GoProxyTunnel, *net.UDPConn) {
 		serverVIP, serverVIPv6, serverInstIP, serverInstIPv6)
 	server.Nodeport = port
 
-	proxy := fakeTunnelOn(nodeAIP)
-	proxy.SetEnvironment(newFakeEnv(fixtureEntries[0], server))
-	return proxy, listener
+	tunnel := fakeTunnelOn(nodeAIP)
+	tunnel.SetResolver(newFakeEnv(fixtureEntries[0], server))
+	return tunnel, listener
 }
 
-// readForwarded reads one datagram the proxy forwarded over the tunnel.
+// readForwarded reads one datagram the tunnel forwarded over the wire.
 func readForwarded(t testing.TB, listener *net.UDPConn) []byte {
 	t.Helper()
 	_ = listener.SetReadDeadline(time.Now().Add(2 * time.Second))

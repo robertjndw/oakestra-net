@@ -2,8 +2,8 @@ package proxy
 
 import (
 	"NetManager/TableEntryCache"
-	"NetManager/env"
 	"NetManager/proxy/iputils"
+	"NetManager/resolver"
 	"bytes"
 	"net"
 	"net/netip"
@@ -38,7 +38,7 @@ func newResolvingEnv(entries ...TableEntryCache.TableEntry) *resolvingEnv {
 	return e
 }
 
-func (e *resolvingEnv) GetTableEntryByServiceIP(addr netip.Addr) env.ServiceLookup {
+func (e *resolvingEnv) GetTableEntryByServiceIP(addr netip.Addr) resolver.ServiceLookup {
 	e.mu.Lock()
 	e.lookups[addr]++
 	resolved := e.resolved[addr]
@@ -49,12 +49,12 @@ func (e *resolvingEnv) GetTableEntryByServiceIP(addr netip.Addr) env.ServiceLook
 			e.pending[addr] = done
 		}
 		e.mu.Unlock()
-		return env.ServiceLookup{Resolving: done}
+		return resolver.ServiceLookup{Resolving: done}
 	}
 	e.mu.Unlock()
 
 	entries, generation := e.table.SearchByServiceIP(addr)
-	return env.ServiceLookup{Entries: entries, Generation: generation}
+	return resolver.ServiceLookup{Entries: entries, Generation: generation}
 }
 
 func (e *resolvingEnv) GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool) {
@@ -78,19 +78,19 @@ func (e *resolvingEnv) release(addr netip.Addr, succeed bool) {
 	}
 }
 
-func (proxy *GoProxyTunnel) queuedFor(vip netip.Addr) int {
-	proxy.replayLock.Lock()
-	defer proxy.replayLock.Unlock()
-	if queue, ok := proxy.replays[vip]; ok {
+func (d *Datapath) queuedFor(vip netip.Addr) int {
+	d.replayLock.Lock()
+	defer d.replayLock.Unlock()
+	if queue, ok := d.replays[vip]; ok {
 		return len(queue.packets)
 	}
 	return 0
 }
 
-func (proxy *GoProxyTunnel) replayState() (queues int, bytes int) {
-	proxy.replayLock.Lock()
-	defer proxy.replayLock.Unlock()
-	return len(proxy.replays), proxy.replayBytes
+func (d *Datapath) replayState() (queues int, bytes int) {
+	d.replayLock.Lock()
+	defer d.replayLock.Unlock()
+	return len(d.replays), d.replayBytes
 }
 
 // waitFor polls until cond holds, so tests never depend on a fixed sleep.
@@ -106,30 +106,26 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// coldTunnel is a loopback tunnel whose target service is not resolved yet.
-func coldTunnel(t *testing.T) (*GoProxyTunnel, *net.UDPConn, *resolvingEnv) {
+// coldDatapath is a Datapath whose target service is not resolved yet. Its
+// replay goroutine's output is captured by a recordingSink rather than sent
+// anywhere real, since these tests only care about what the datapath decided
+// to do with each queued packet, not about actual socket I/O.
+func coldDatapath(t *testing.T) (*Datapath, *recordingSink, *resolvingEnv) {
 	t.Helper()
-	proxy, listener := loopbackTunnel(t)
-
-	resolving := newResolvingEnv()
-	for _, entry := range loopbackEntries(t, listener) {
-		if err := resolving.table.Add(entry); err != nil {
-			t.Fatal(err)
-		}
-	}
-	proxy.SetEnvironment(resolving)
-	return proxy, listener, resolving
+	resolving := newResolvingEnv(replayFixtureEntries()...)
+	sink := &recordingSink{}
+	dp := NewDatapath(resolving, mustAddr(nodeAIP), fixtureIPv4Prefix, fixtureIPv6Prefix, sink)
+	return dp, sink, resolving
 }
 
-func loopbackEntries(t *testing.T, listener *net.UDPConn) []TableEntryCache.TableEntry {
-	t.Helper()
-	port := listener.LocalAddr().(*net.UDPAddr).Port
-	server := tableEntry("serverapp", "127.0.0.1", serverNsIP, serverNsIPv6,
+// replayFixtureEntries mirrors the standard fixture table but is inserted
+// into resolvingEnv's own table, which starts every ServiceIP off unresolved
+// until release is called.
+func replayFixtureEntries() []TableEntryCache.TableEntry {
+	server := tableEntry("serverapp", nodeBIP, serverNsIP, serverNsIPv6,
 		serverVIP, serverVIPv6, serverInstIP, serverInstIPv6)
-	server.Nodeport = port
-	other := tableEntry("otherapp", "127.0.0.1", otherNsIP, otherNsIPv6,
+	other := tableEntry("otherapp", nodeCIP, otherNsIP, otherNsIPv6,
 		otherVIP, otherVIPv6, otherInstIP, otherInstIPv6)
-	other.Nodeport = port
 	return []TableEntryCache.TableEntry{fixtureEntries[0], server, other}
 }
 
@@ -148,60 +144,72 @@ func datagramPayload(t *testing.T, wire []byte) string {
 // therefore the order the datagrams left the node in - was the scheduler's
 // choice, not the application's.
 func TestReplayPreservesOrder(t *testing.T) {
-	proxy, listener, resolving := coldTunnel(t)
+	dp, sink, resolving := coldDatapath(t)
 	vip := mustAddr(serverVIP)
 
 	const datagrams = 16
 	payloads := make([]string, datagrams)
 	for i := range payloads {
 		payloads[i] = string(rune('a'+i)) + "-datagram"
-		proxy.handleOutgoing(buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, []byte(payloads[i])), true)
+		dp.Handle(Outgoing, buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, []byte(payloads[i])))
 	}
 
-	if got := proxy.queuedFor(vip); got != datagrams {
+	if got := dp.queuedFor(vip); got != datagrams {
 		t.Fatalf("queued %d packets; want %d", got, datagrams)
 	}
 	// One queue for the Service IP, not one per packet.
-	if queues, _ := proxy.replayState(); queues != 1 {
+	if queues, _ := dp.replayState(); queues != 1 {
 		t.Fatalf("%d replay queues for a single Service IP; want 1", queues)
 	}
 
 	resolving.release(vip, true)
 
+	waitFor(t, "the replay queue to be released", func() bool {
+		queues, bytes := dp.replayState()
+		return queues == 0 && bytes == 0
+	})
+
+	actions := sink.drain()
+	if len(actions) != datagrams {
+		t.Fatalf("replay emitted %d actions; want %d", len(actions), datagrams)
+	}
 	for i, want := range payloads {
-		if got := datagramPayload(t, readForwarded(t, listener)); got != want {
+		if actions[i].Kind != ActionForward {
+			t.Fatalf("datagram %d emitted as kind %v; want ActionForward", i, actions[i].Kind)
+		}
+		if got := datagramPayload(t, actions[i].Packet); got != want {
 			t.Fatalf("datagram %d was %q; want %q - replay reordered the queue", i, got, want)
 		}
 	}
-
-	waitFor(t, "the replay queue to be released", func() bool {
-		queues, bytes := proxy.replayState()
-		return queues == 0 && bytes == 0
-	})
 }
 
 // TestReplaySeparateVIPsResolveIndependently: one Service IP resolving must
 // not flush packets waiting on another.
 func TestReplaySeparateVIPsResolveIndependently(t *testing.T) {
-	proxy, listener, resolving := coldTunnel(t)
+	dp, sink, resolving := coldDatapath(t)
 
-	proxy.handleOutgoing(buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, []byte("for-server")), true)
-	proxy.handleOutgoing(buildUDPv4(t, clientNsIP, otherVIP, 40000, 53, []byte("for-other")), true)
+	dp.Handle(Outgoing, buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, []byte("for-server")))
+	dp.Handle(Outgoing, buildUDPv4(t, clientNsIP, otherVIP, 40000, 53, []byte("for-other")))
 
-	if queues, _ := proxy.replayState(); queues != 2 {
+	if queues, _ := dp.replayState(); queues != 2 {
 		t.Fatalf("%d replay queues; want one per Service IP", queues)
 	}
 
 	resolving.release(mustAddr(serverVIP), true)
 
-	if got := datagramPayload(t, readForwarded(t, listener)); got != "for-server" {
-		t.Errorf("forwarded %q; want the resolved Service IP's datagram", got)
-	}
 	waitFor(t, "only the resolved Service IP's queue to drain", func() bool {
-		queues, _ := proxy.replayState()
+		queues, _ := dp.replayState()
 		return queues == 1
 	})
-	if got := proxy.queuedFor(mustAddr(otherVIP)); got != 1 {
+
+	actions := sink.drain()
+	if len(actions) != 1 {
+		t.Fatalf("replay emitted %d actions; want 1", len(actions))
+	}
+	if got := datagramPayload(t, actions[0].Packet); got != "for-server" {
+		t.Errorf("forwarded %q; want the resolved Service IP's datagram", got)
+	}
+	if got := dp.queuedFor(mustAddr(otherVIP)); got != 1 {
 		t.Errorf("the unresolved Service IP has %d packets queued; want 1", got)
 	}
 }
@@ -209,16 +217,16 @@ func TestReplaySeparateVIPsResolveIndependently(t *testing.T) {
 // TestReplayQueueBounded: the queue is capped, and the cap is expressed in
 // packets actually retained rather than pooled 64KiB buffers.
 func TestReplayQueueBounded(t *testing.T) {
-	proxy, _, _ := coldTunnel(t)
+	dp, _, _ := coldDatapath(t)
 
 	for i := 0; i < maxReplayPacketsPerVIP*3; i++ {
-		proxy.handleOutgoing(buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, []byte("x")), true)
+		dp.Handle(Outgoing, buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, []byte("x")))
 	}
 
-	if got := proxy.queuedFor(mustAddr(serverVIP)); got != maxReplayPacketsPerVIP {
+	if got := dp.queuedFor(mustAddr(serverVIP)); got != maxReplayPacketsPerVIP {
 		t.Errorf("queued %d packets; want the cap of %d", got, maxReplayPacketsPerVIP)
 	}
-	_, bytes := proxy.replayState()
+	_, bytes := dp.replayState()
 	if bytes > maxReplayBytes {
 		t.Errorf("retained %d bytes; cap is %d", bytes, maxReplayBytes)
 	}
@@ -233,15 +241,15 @@ func TestReplayQueueBounded(t *testing.T) {
 // TestReplayFailedResolutionReleasesQueue: an attempt that finishes without
 // resolving anything must drop its queue rather than re-queue it forever.
 func TestReplayFailedResolutionReleasesQueue(t *testing.T) {
-	proxy, _, resolving := coldTunnel(t)
+	dp, _, resolving := coldDatapath(t)
 
 	for i := 0; i < 4; i++ {
-		proxy.handleOutgoing(buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, []byte("x")), true)
+		dp.Handle(Outgoing, buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, []byte("x")))
 	}
 	resolving.release(mustAddr(serverVIP), false)
 
 	waitFor(t, "the failed queue to be released", func() bool {
-		queues, bytes := proxy.replayState()
+		queues, bytes := dp.replayState()
 		return queues == 0 && bytes == 0
 	})
 }
@@ -252,27 +260,40 @@ func TestReplayFailedResolutionReleasesQueue(t *testing.T) {
 // forwardLaterFragment, found no translation state and were dropped - so the
 // datagram could never reassemble no matter how the replay went.
 func TestReplayHoldsLaterFragmentsOfAColdDatagram(t *testing.T) {
-	proxy, listener, resolving := coldTunnel(t)
+	dp, sink, resolving := coldDatapath(t)
 	vip := mustAddr(serverVIP)
 
 	wire := buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, largePayload(2000))
 	first, later := fragmentIPv4(t, wire, 1024)
 	laterPayloadBefore := append([]byte(nil), later[20:]...)
 
-	proxy.handleOutgoing(first, true)
-	proxy.handleOutgoing(later, true)
+	dp.Handle(Outgoing, first)
+	dp.Handle(Outgoing, later)
 
-	if got := proxy.queuedFor(vip); got != 2 {
+	if got := dp.queuedFor(vip); got != 2 {
 		t.Fatalf("%d packets queued behind the unresolved Service IP; want both fragments", got)
 	}
 
 	resolving.release(vip, true)
 
-	gotFirst := parseTestPacket(t, readForwarded(t, listener))
+	waitFor(t, "the replay queue to be released", func() bool {
+		queues, bytes := dp.replayState()
+		return queues == 0 && bytes == 0
+	})
+
+	actions := sink.drain()
+	if len(actions) != 2 {
+		t.Fatalf("replay emitted %d actions; want 2", len(actions))
+	}
+	if actions[0].Kind != ActionForward || actions[1].Kind != ActionForward {
+		t.Fatalf("replay actions = %v, %v; want both ActionForward", actions[0].Kind, actions[1].Kind)
+	}
+
+	gotFirst := parseTestPacket(t, actions[0].Packet)
 	if !gotFirst.IsFirstFragment() {
 		t.Fatal("the first fragment must replay before the rest")
 	}
-	gotLater, ok := iputils.Parse(readForwarded(t, listener))
+	gotLater, ok := iputils.Parse(actions[1].Packet)
 	if !ok {
 		t.Fatal("the later fragment was never forwarded")
 	}
@@ -303,14 +324,14 @@ func TestReplayHoldsLaterFragmentsOfAColdDatagram(t *testing.T) {
 // already waiting on its destination there is no first fragment for it to stay
 // consistent with, and it must simply be dropped.
 func TestLaterFragmentNeverStartsAResolution(t *testing.T) {
-	proxy, _, _ := coldTunnel(t)
+	dp, _, _ := coldDatapath(t)
 
 	wire := buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, largePayload(2000))
 	_, later := fragmentIPv4(t, wire, 1024)
 
-	proxy.handleOutgoing(later, true)
+	dp.Handle(Outgoing, later)
 
-	if queues, bytes := proxy.replayState(); queues != 0 || bytes != 0 {
+	if queues, bytes := dp.replayState(); queues != 0 || bytes != 0 {
 		t.Errorf("a lone later fragment created %d replay queues holding %d bytes; want none",
 			queues, bytes)
 	}
@@ -319,20 +340,20 @@ func TestLaterFragmentNeverStartsAResolution(t *testing.T) {
 // TestReplayFragmentQueueRespectsBounds: fragments queue through the same
 // bounded FIFO as everything else, so a flood cannot grow it without limit.
 func TestReplayFragmentQueueRespectsBounds(t *testing.T) {
-	proxy, _, _ := coldTunnel(t)
+	dp, _, _ := coldDatapath(t)
 
 	wire := buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, largePayload(2000))
 	first, later := fragmentIPv4(t, wire, 1024)
 
-	proxy.handleOutgoing(first, true)
+	dp.Handle(Outgoing, first)
 	for range maxReplayPacketsPerVIP * 3 {
-		proxy.handleOutgoing(append([]byte(nil), later...), true)
+		dp.Handle(Outgoing, append([]byte(nil), later...))
 	}
 
-	if got := proxy.queuedFor(mustAddr(serverVIP)); got != maxReplayPacketsPerVIP {
+	if got := dp.queuedFor(mustAddr(serverVIP)); got != maxReplayPacketsPerVIP {
 		t.Errorf("queued %d packets; want the cap of %d", got, maxReplayPacketsPerVIP)
 	}
-	if _, bytes := proxy.replayState(); bytes > maxReplayBytes {
+	if _, bytes := dp.replayState(); bytes > maxReplayBytes {
 		t.Errorf("retained %d bytes; cap is %d", bytes, maxReplayBytes)
 	}
 }

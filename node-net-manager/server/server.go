@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"time"
 
@@ -67,7 +68,7 @@ func HandleRequests(port int) {
 		go update()
 	}
 
-	handlers.RegisterAllManagers(&Env, &model.WorkerID, model.NetConfig.NodePublicAddress, model.NetConfig.NodePublicPort, netRouter)
+	handlers.RegisterAllManagers(Env, &model.WorkerID, model.NetConfig.NodePublicAddress, model.NetConfig.NodePublicPort, netRouter)
 
 	if port <= 0 {
 		logger.InfoLogger().Println("Starting NetManager on unix socket /etc/netmanager/netmanager.sock")
@@ -83,8 +84,8 @@ func HandleRequests(port int) {
 }
 
 var (
-	Env   env.Environment
-	Proxy *proxy.GoProxyTunnel
+	Env   *env.Environment
+	Proxy *proxy.Tunnel
 )
 
 /*
@@ -143,13 +144,18 @@ func register(writer http.ResponseWriter, request *http.Request) {
 	mqtt.InitNetMqttClient(requestStruct.ClientID, model.NetConfig.ClusterUrl, model.NetConfig.ClusterMqttPort, model.NetConfig.MqttCert, model.NetConfig.MqttKey)
 
 	// initialize the proxy tunnel
-	Proxy = proxy.New()
+	ipstring, _ := network.GetLocalIPandIface()
+	localIP, err := netip.ParseAddr(ipstring)
+	if err != nil {
+		log.Fatalf("Unable to parse the local IP %q: %s", ipstring, err)
+	}
+	Proxy = proxy.New(localIP)
 	Proxy.Listen()
 
 	// initialize the Env Manager
-	Env = *env.NewEnvironmentClusterConfigured(Proxy.HostTUNDeviceName)
+	Env = env.NewEnvironmentClusterConfigured(Proxy.HostTUNDeviceName)
 
-	Proxy.SetEnvironment(&Env)
+	Proxy.SetResolver(Env.Resolver())
 
 	logger.InfoLogger().Printf("NetManager is now running 🟢")
 	writer.WriteHeader(http.StatusOK)

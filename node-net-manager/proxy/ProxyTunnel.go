@@ -1,18 +1,15 @@
 package proxy
 
 import (
-	"NetManager/TableEntryCache"
-	"NetManager/env"
 	"NetManager/logger"
-	"NetManager/proxy/iputils"
-	"math/rand/v2"
 	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/songgao/water"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // packetReadBufferSize is how much is read per packet off the TUN device or
@@ -21,6 +18,18 @@ import (
 // kernel's socket buffer, and reusing it here would size every pooled
 // per-packet buffer at multiple megabytes for no benefit.
 const packetReadBufferSize = 64 * 1024
+
+// batchPacketCap is the per-packet payload capacity of both batched read
+// loops' buffers (see ingoingBatch/outgoingBatch). Unlike
+// packetReadBufferSize's sync.Pool, which grows and shrinks with demand,
+// these are fixed arrays of TunDevice.BatchSize() buffers held for the
+// process lifetime - so this size sets a hard memory floor: at Linux's
+// typical BatchSize() of 128, packetReadBufferSize's 64KiB would pin 8MiB per
+// loop for datagrams that cannot exceed the MTU by much. 9000 bytes covers
+// the jumbo-frame ceiling widely used by cloud VPCs (AWS, GCP) - comfortably
+// above any MTU this proxy is likely configured with - while keeping the
+// worst case (128 * (tunHeaderOffset+9000)) to about 1.1MiB per loop.
+const batchPacketCap = 9000
 
 // socketBufferSize is the requested SO_RCVBUF/SO_SNDBUF size for the tunnel
 // UDP sockets. Larger than the previous 64KB so a burst of packets has room
@@ -49,51 +58,74 @@ type Configuration struct {
 	ProxySubnetworkIPv6Prefix int    `json:"ProxySubnetworkIPv6Prefix"`
 }
 
+// batchWriter is the family-independent surface of *ipv4.PacketConn and
+// *ipv6.PacketConn a tunnelConn needs. ipv4.Message and ipv6.Message are both
+// aliases of the same underlying type (golang.org/x/net's internal
+// socket.Message), so one interface expressed in either package's Message
+// type is satisfied by both wrappers - there is no family-specific method set
+// to bridge here, just two constructors (see newTunnelConn).
+type batchWriter interface {
+	WriteBatch(ms []ipv4.Message, flags int) (int, error)
+}
+
 // tunnelConn is one UDP socket to a peer node, plus the coarse timestamp the
-// idle sweeper uses to decide when to close it.
+// idle sweeper uses to decide when to close it and a batched writer for
+// grouped outgoing sends (see Tunnel.sendOverTunnelBatch).
 type tunnelConn struct {
 	conn     *net.UDPConn
 	lastUsed atomic.Int64
+	// batch is conn wrapped for WriteBatch - see newTunnelConn for why the
+	// wrapper's family has to match dst rather than always being one or the
+	// other.
+	batch batchWriter
 }
 
-type GoProxyTunnel struct {
-	environment       env.EnvironmentManager
-	listenConnection  *net.UDPConn
+// Tunnel owns the TUN device, the listen socket, the per-peer connection pool
+// and its idle eviction, the read loops and the lifecycle channels - every bit
+// of actual socket/TUN I/O. It performs no translation decisions itself;
+// those belong to Datapath, which it drives via Handle/Emit.
+type Tunnel struct {
+	dp *Datapath
+	// sock is the tunnel's listen socket - only ever used for the batched
+	// ingoing read (see ingoingLoop). Sending to a peer still goes through
+	// connectionBuffer's per-peer dialled connections below (see
+	// sendOverTunnelBatch): unifying the two so a single sendmmsg could cover
+	// every destination at once is deliberately out of scope, not an
+	// oversight - it would source tunnel traffic from the listen port instead
+	// of an ephemeral one, which firewalls and NAT in real deployments treat
+	// very differently.
+	sock              TunnelSocket
 	connectionBuffer  map[netip.AddrPort]*tunnelConn
-	ifce              *water.Interface
+	tun               TunDevice
 	finishChannel     chan bool
 	errorChannel      chan error
 	stopChannel       chan bool
 	HostTUNDeviceName string
 	tunNetIPv6        string
 	tunNetIP          string
-	mtusize           string
-	// The proxy subnetworks are netip.Prefix rather than net.IPNet so the
-	// per-packet containment check needs no conversion of the parsed address.
-	ProxyIPv4Prefix netip.Prefix
-	ProxyIPv6Prefix netip.Prefix
-	localIP         netip.Addr
-	proxycache      *ProxyCache
-	TunnelPort      int
+	mtu               int
+	TunnelPort        int
 	// connectionBufferLock guards only connectionBuffer. net.UDPConn is
 	// itself safe for concurrent use, so nothing else needs to hold this
 	// while a packet is actually being written.
 	connectionBufferLock sync.RWMutex
-	// replayLock guards replays and replayBytes. Both are only touched on a
-	// cold miss, never on the steady-state packet path.
-	replayLock  sync.Mutex
-	replays     map[netip.Addr]*pendingReplay
-	replayBytes int
-	isListening bool
+	isListening          bool
 }
 
-// packetBufPool holds MTU-sized buffers for reading packets off the TUN
-// device and the UDP socket, so the read loops don't allocate one per
-// packet. Buffers are always pooled at full capacity and resliced by the
-// caller after a read.
+// packetBufPool holds MTU-sized buffers for Emit's ActionDeliver copies (the
+// replay goroutine's only path back to the TUN device), so it doesn't
+// allocate one per packet. Both batched read loops have their own
+// fixed-size pool instead - see ingoingBatch/outgoingBatch - since their
+// buffers need to stay put across a whole batch rather than being returned to
+// a shared pool after each packet. Buffers here are always pooled at full
+// capacity and resliced by the caller after a read.
+//
+// Every buffer here reserves tunHeaderOffset bytes up front - see TunDevice -
+// since these are also the buffers Emit's ActionDeliver case writes back to
+// the TUN device.
 var packetBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, packetReadBufferSize)
+		b := make([]byte, tunHeaderOffset+packetReadBufferSize)
 		return &b
 	},
 }
@@ -107,452 +139,54 @@ func putPacketBuf(b *[]byte) {
 	packetBufPool.Put(b)
 }
 
-// handleOutgoing processes one packet read from the TUN device: translate it
-// (if it targets the semantic-routing subnetwork) and forward it on. buf is
-// only used for the duration of this call, unless it ends up retained for
-// replay (see retainForReplay). mayRetain must be false when called from a
-// replay goroutine itself - otherwise a resolution that succeeds but still
-// yields no matching table entry would re-enter and replay forever.
-func (proxy *GoProxyTunnel) handleOutgoing(buf []byte, mayRetain bool) {
-	pkt, ok := iputils.Parse(buf)
-	if !ok {
+// Emit performs the Action the Datapath decided on: dropping it, writing it
+// to the TUN device, or sending it over the tunnel to another node. Today its
+// only caller is the replay goroutine inside Datapath (see Sink) - both
+// synchronous read loops call Handle directly and batch the result
+// themselves instead (see runIngoingBatch, runOutgoingBatch) - so, unlike
+// those, it cannot assume action.Packet already sits in a buffer with the TUN
+// device's header room reserved (a replayed packet is a bare copy - see
+// Datapath.enqueueReplayLocked) and always copies onto a pooled buffer that
+// does before writing.
+func (t *Tunnel) Emit(action Action) {
+	switch action.Kind {
+	case ActionDrop:
 		return
-	}
-	if logger.IsDebug() {
-		logger.DebugLogger().Printf("Outgoing packet:\t\t\t%s ---> %s\n", pkt.SrcIP(), pkt.DstIP())
-	}
-
-	// A later fragment has no transport header to resolve a flow with, only
-	// the translation its first fragment already established. If that first
-	// fragment is itself still queued waiting for the route, this one has to
-	// wait behind it rather than be dropped - otherwise the datagram loses
-	// every fragment but the first and can never reassemble.
-	if isLaterFragment(&pkt) {
-		if !proxy.forwardLaterFragment(&pkt) && mayRetain {
-			proxy.retainFragmentForReplay(buf, pkt.DstIP())
+	case ActionDeliver:
+		buf := getPacketBuf()
+		n := copy((*buf)[tunHeaderOffset:], action.Packet)
+		if _, err := t.tun.WriteBatch([][]byte{(*buf)[:tunHeaderOffset+n]}); err != nil {
+			logger.ErrorLogger().Println(err)
 		}
-		return
+		putPacketBuf(buf)
+	case ActionForward:
+		t.sendOverTunnel(action.Dst, action.Packet, 0)
 	}
-	if !pkt.HasTransport() {
-		return
-	}
-
-	// The fragment key has to be taken before outgoingProxy rewrites the
-	// addresses, so it matches the later fragments, which arrive untranslated.
-	var fragKey fragmentKey
-	firstFragment := pkt.IsFragment()
-	if firstFragment {
-		fragKey = keyFor(&pkt)
-	}
-
-	dstHost, dstPort, resolving, ok := proxy.outgoingProxy(&pkt)
-	if !ok {
-		if mayRetain && resolving != nil {
-			proxy.retainForReplay(buf, pkt.DstIP(), resolving)
-		}
-		return
-	}
-
-	if firstFragment {
-		proxy.proxycache.frags.remember(fragKey, fragmentTranslation{
-			newSrc:      pkt.SrcIP(),
-			newDst:      pkt.DstIP(),
-			dstNode:     dstHost,
-			dstNodePort: dstPort,
-		})
-	}
-	proxy.forward(dstHost, dstPort, pkt.Bytes(), 0)
-}
-
-// forwardLaterFragment translates a non-first fragment using the state its
-// first fragment left behind and sends it to the same node. Only the
-// addresses (and, for IPv4, the header checksum) are rewritten - there is no
-// transport header here to checksum, and Rewrite already knows not to look
-// for one. Reports false when there is no such state, so the caller can
-// decide whether the fragment is worth holding onto.
-func (proxy *GoProxyTunnel) forwardLaterFragment(pkt *iputils.Packet) bool {
-	translation, ok := proxy.proxycache.frags.lookup(keyFor(pkt))
-	if !ok {
-		return false
-	}
-	if !pkt.Rewrite(translation.newSrc, translation.newDst) {
-		return false
-	}
-	proxy.forward(translation.dstNode, translation.dstNodePort, pkt.Bytes(), 0)
-	return true
-}
-
-// isLaterFragment reports whether pkt is a fragment carrying no transport
-// header. Non-TCP/UDP protocols are excluded: this proxy only ever translates
-// those two, so fragment state is never kept for anything else.
-func isLaterFragment(pkt *iputils.Packet) bool {
-	if !pkt.IsFragment() || pkt.IsFirstFragment() {
-		return false
-	}
-	return pkt.Protocol() == iputils.ProtoTCP || pkt.Protocol() == iputils.ProtoUDP
-}
-
-// maxReplayPacketsPerVIP bounds how many packets may queue behind one
-// unresolved Service IP, and maxReplayBytes bounds the total across all of
-// them. The old scheme kept a 64KiB pooled buffer per retained packet, so a
-// full queue pinned 16MiB to hold packets of around the 1450-byte MTU.
-const (
-	maxReplayPacketsPerVIP = 32
-	maxReplayBytes         = 1 << 20
-)
-
-// pendingReplay is the FIFO of packets waiting on one Service IP's resolution.
-// Guarded by GoProxyTunnel.replayLock.
-type pendingReplay struct {
-	packets [][]byte
-	bytes   int
-}
-
-// retainForReplay holds a copy of a packet whose ServiceIP is still being
-// resolved and re-runs it once resolution finishes. Resolution can't happen on
-// the packet path, so without this the first packet of every cold flow is
-// lost: harmless for TCP, which retransmits, but it silently drops a one-shot
-// UDP datagram whose only fault was arriving before its route.
-//
-// Packets queue per Service IP and replay in arrival order. Giving each
-// retained packet its own goroutine instead - all of them blocked on the same
-// resolution channel - hands the order they resume in to the scheduler, which
-// reorders datagrams an application submitted in sequence.
-func (proxy *GoProxyTunnel) retainForReplay(buf []byte, vip netip.Addr, resolving <-chan struct{}) {
-	proxy.replayLock.Lock()
-
-	if queue, waiting := proxy.replays[vip]; waiting {
-		proxy.enqueueReplayLocked(queue, buf)
-		proxy.replayLock.Unlock()
-		return
-	}
-
-	queue := &pendingReplay{}
-	if !proxy.enqueueReplayLocked(queue, buf) {
-		proxy.replayLock.Unlock()
-		return
-	}
-	if proxy.replays == nil {
-		proxy.replays = make(map[netip.Addr]*pendingReplay)
-	}
-	proxy.replays[vip] = queue
-	proxy.replayLock.Unlock()
-
-	// Exactly one waiter per Service IP, started when its queue is created.
-	go proxy.replayWhenResolved(vip, resolving)
-}
-
-// retainFragmentForReplay queues a later fragment behind the first fragment of
-// its own datagram, which is already waiting for this Service IP to resolve.
-// A later fragment is still addressed to the untranslated Service IP, so it
-// keys into the same queue, and replay is FIFO - the first fragment installs
-// the translation before these reach forwardLaterFragment again.
-//
-// It only ever appends to a queue that already exists. A later fragment
-// carries no transport ports, so it cannot drive a resolution of its own, and
-// with nothing already waiting there is no first fragment for it to stay
-// consistent with - buffering it speculatively would mean holding
-// attacker-controllable bytes for a first fragment that may never come.
-//
-// That is not a gap in normal operation: outgoingLoop is the only reader of
-// the TUN device and processes packets one at a time, so the local kernel's
-// own fragments reach handleOutgoing in the order it emitted them. The one
-// interleaving that does occur is with a replay in progress, and
-// replayWhenResolved keeps its queue published for exactly that reason.
-func (proxy *GoProxyTunnel) retainFragmentForReplay(buf []byte, vip netip.Addr) {
-	proxy.replayLock.Lock()
-	defer proxy.replayLock.Unlock()
-
-	if queue, waiting := proxy.replays[vip]; waiting {
-		proxy.enqueueReplayLocked(queue, buf)
-	}
-}
-
-// enqueueReplayLocked copies buf onto queue unless the per-Service-IP packet
-// cap or the global byte budget is already reached. buf belongs to
-// outgoingLoop's pool and is reused as soon as handleOutgoing returns, so it
-// must be copied before being held past that call; the copy is sized to the
-// packet, not to the pool's buffer.
-//
-// Drop-newest: a full queue means the application is already ahead of
-// resolution, and evicting the head would reorder what does get through.
-// Caller must hold replayLock.
-func (proxy *GoProxyTunnel) enqueueReplayLocked(queue *pendingReplay, buf []byte) bool {
-	if len(queue.packets) >= maxReplayPacketsPerVIP {
-		return false
-	}
-	if proxy.replayBytes+len(buf) > maxReplayBytes {
-		return false
-	}
-	queue.packets = append(queue.packets, append([]byte(nil), buf...))
-	queue.bytes += len(buf)
-	proxy.replayBytes += len(buf)
-	return true
-}
-
-// replayWhenResolved waits for one Service IP's resolution attempt to finish
-// and then re-runs everything queued behind it, in order. A failed attempt
-// needs no special case: the replays miss the table again and are dropped,
-// because they are not allowed to re-queue themselves.
-func (proxy *GoProxyTunnel) replayWhenResolved(vip netip.Addr, resolving <-chan struct{}) {
-	<-resolving
-
-	// Drain in rounds, leaving the queue published until it is actually
-	// empty. outgoingLoop keeps reading the TUN while this runs, so a later
-	// fragment of a datagram being replayed right now can still arrive; if the
-	// queue were detached up front it would find neither a queue to join nor
-	// the translation state its first fragment is about to install, and be
-	// dropped microseconds before it would have worked.
-	//
-	// This terminates: once resolution has finished, handleOutgoing only
-	// retains a packet while GetTableEntryByServiceIP reports a resolution
-	// still in flight. After success the route is in the table, and after
-	// failure the negative cache is armed before this channel closes - so
-	// nothing new joins the queue and the next round finds it empty.
-	for {
-		proxy.replayLock.Lock()
-		queue := proxy.replays[vip]
-		if queue == nil || len(queue.packets) == 0 {
-			delete(proxy.replays, vip)
-			if queue != nil {
-				proxy.replayBytes -= queue.bytes
-			}
-			proxy.replayLock.Unlock()
-			return
-		}
-		packets := queue.packets
-		proxy.replayBytes -= queue.bytes
-		queue.packets, queue.bytes = nil, 0
-		proxy.replayLock.Unlock()
-
-		for _, packet := range packets {
-			proxy.handleOutgoing(packet, false)
-		}
-	}
-}
-
-// handleIngoing processes one packet received on the tunnel UDP socket (or
-// forwarded locally, see forward()): reverse-translate it if it matches an
-// outstanding flow, then write it to the TUN device. buf is only used for
-// the duration of this call.
-func (proxy *GoProxyTunnel) handleIngoing(buf []byte) {
-	pkt, ok := iputils.Parse(buf)
-	if !ok {
-		return
-	}
-	if logger.IsDebug() {
-		logger.DebugLogger().Printf("Ingoing packet:\t\t\t %s <--- %s\n", pkt.DstIP(), pkt.SrcIP())
-	}
-
-	if isLaterFragment(&pkt) {
-		// Unlike the outgoing direction, an unknown fragment is still written
-		// to the TUN device: an ingoing packet with no reverse mapping is
-		// forwarded unchanged here, and a fragment is no different. That is
-		// the common case on this path - ingoingProxy only matches flows this
-		// node originated, so every inbound *request* is unmatched.
-		//
-		// Known limitation: if the two tunnel datagrams reorder and a later
-		// fragment arrives before a first fragment that does get
-		// reverse-translated, the two are written with different sources and
-		// the datagram will not reassemble. Holding unknown later fragments
-		// to cover that would penalise the far more common pass-through case.
-		if translation, known := proxy.proxycache.frags.lookup(keyFor(&pkt)); known {
-			pkt.Rewrite(translation.newSrc, translation.newDst)
-		}
-	} else {
-		if !pkt.HasTransport() {
-			return
-		}
-
-		var fragKey fragmentKey
-		firstFragment := pkt.IsFragment()
-		if firstFragment {
-			fragKey = keyFor(&pkt)
-		}
-
-		// ingoingProxy returning false just means there's no reverse mapping
-		// for this flow - the packet is still forwarded to the TUN device
-		// unchanged.
-		if proxy.ingoingProxy(&pkt) && firstFragment {
-			proxy.proxycache.frags.remember(fragKey, fragmentTranslation{
-				newSrc: pkt.SrcIP(),
-				newDst: pkt.DstIP(),
-			})
-		}
-	}
-
-	if _, err := proxy.ifce.Write(pkt.Bytes()); err != nil {
-		logger.ErrorLogger().Println(err)
-	}
-}
-
-// outgoingProxy rewrites pkt in place if its destination falls in the
-// semantic-routing subnetwork, resolving the target instance via the
-// translation table (proxy.environment) and the per-flow ProxyCache. ok is
-// false if the packet isn't part of the proxy subnetwork, or its ServiceIP
-// can't currently be resolved - either way it should be dropped. resolving is
-// non-nil only when the ServiceIP is still being resolved in the background
-// (a cold miss), so the caller can hold onto the packet and retry once it
-// closes instead of losing it outright.
-func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPort int, resolving <-chan struct{}, ok bool) {
-	dstIP := pkt.DstIP()
-	srcIP := pkt.SrcIP()
-	protocol := pkt.Protocol()
-	srcport := int(pkt.SrcPort())
-	dstport := int(pkt.DstPort())
-
-	var inProxySubnet bool
-	if pkt.Version() == 4 {
-		inProxySubnet = proxy.ProxyIPv4Prefix.Contains(dstIP)
-	} else {
-		inProxySubnet = proxy.ProxyIPv6Prefix.Contains(dstIP)
-	}
-	if !inProxySubnet {
-		return netip.Addr{}, 0, nil, false
-	}
-
-	// Check if the ServiceIP is known
-	lookup := proxy.environment.GetTableEntryByServiceIP(dstIP)
-	if len(lookup.Entries) < 1 {
-		return netip.Addr{}, 0, lookup.Resolving, false
-	}
-
-	// Find the instanceIP of the current service
-	instanceIP, ok := proxy.convertToInstanceIp(pkt.Version(), srcIP)
-	if !ok {
-		return netip.Addr{}, 0, nil, false
-	}
-
-	// Check proxy proxycache (if any active flow is there already)
-	entry, exist := proxy.proxycache.RetrieveByServiceIP(protocol, srcIP, instanceIP, srcport, dstIP, dstport)
-	usable := exist && entry.dstport >= 1
-	if usable && entry.routeGen != lookup.Generation {
-		// The table changed since this route was picked, so it has to be
-		// checked against the current replica set once. While the generation
-		// matches, that scan is skipped entirely.
-		usable = TableEntryCache.IsRouteStillValid(entry.dstip, entry.dstNode, entry.dstNodePort, lookup.Entries)
-		if usable {
-			proxy.proxycache.MarkRouteCurrent(entry, lookup.Generation)
-		}
-	}
-
-	if !usable {
-		// Choose between the table entry according to the ServiceIP algorithm
-		// TODO: so far this only uses RR, ServiceIP policies should be implemented here
-		// rand.IntN (math/rand/v2) is safe to call concurrently and seeded
-		// per-process, unlike a shared *rand.Rand - needed now that replay
-		// goroutines (see retainForReplay) can call in here too.
-		tableEntry := lookup.Entries[rand.IntN(len(lookup.Entries))]
-
-		entryDstIPnet := tableEntry.Nsip
-		if pkt.Version() == 6 {
-			entryDstIPnet = tableEntry.Nsipv6
-		}
-		entryDstIP, ok := TableEntryCache.AddrFromIP(entryDstIPnet)
-		if !ok {
-			return netip.Addr{}, 0, nil, false
-		}
-		nodeAddr, ok := TableEntryCache.AddrFromIP(tableEntry.Nodeip)
-		if !ok {
-			return netip.Addr{}, 0, nil, false
-		}
-
-		// Update proxycache. dstNode/dstNodePort are cached here too - an
-		// Nsip is only ever valid on the node that handed it out, so as long
-		// as this cache entry (and its dstip) is still valid there's no need
-		// to look Nodeip/Nodeport back up by Nsip on every packet.
-		entry = ConversionEntry{
-			srcip:         srcIP,
-			dstip:         entryDstIP,
-			dstServiceIp:  dstIP,
-			srcInstanceIp: instanceIP,
-			dstInstanceIp: instanceAddrOf(&tableEntry, pkt.Version()),
-			srcport:       srcport,
-			dstport:       dstport,
-			protocol:      protocol,
-			dstNode:       nodeAddr,
-			dstNodePort:   tableEntry.Nodeport,
-			routeGen:      lookup.Generation,
-		}
-		proxy.proxycache.Add(entry)
-	}
-
-	if !pkt.Rewrite(entry.srcInstanceIp, entry.dstip) {
-		return netip.Addr{}, 0, nil, false
-	}
-	return entry.dstNode, entry.dstNodePort, nil, true
-}
-
-// instanceAddrOf returns the "instance IP" that uniquely identifies one
-// deployed instance of a service, in the requested address family. It is the
-// address that instance's own proxy will source its replies from.
-func instanceAddrOf(entry *TableEntryCache.TableEntry, version uint8) netip.Addr {
-	for _, sip := range entry.ServiceIP {
-		if sip.IpType != TableEntryCache.InstanceNumber {
-			continue
-		}
-		instanceIPnet := sip.Address
-		if version == 6 {
-			instanceIPnet = sip.Address_v6
-		}
-		addr, _ := TableEntryCache.AddrFromIP(instanceIPnet)
-		return addr
-	}
-	return netip.Addr{}
-}
-
-// convertToInstanceIp resolves the stable "instance IP" that identifies
-// srcIP's own service instance, for use as the translated source address.
-func (proxy *GoProxyTunnel) convertToInstanceIp(version uint8, srcIP netip.Addr) (netip.Addr, bool) {
-	instanceTableEntry, instanceexist := proxy.environment.GetTableEntryByNsIP(srcIP)
-	if !instanceexist {
-		logger.ErrorLogger().Println("Unable to find instance IP for service: ", srcIP)
-		return netip.Addr{}, false
-	}
-	addr := instanceAddrOf(&instanceTableEntry, version)
-	return addr, addr.IsValid()
-}
-
-// ingoingProxy checks the ProxyCache for a reverse mapping (a flow this node
-// itself originated via outgoingProxy) and, if found, rewrites pkt in place
-// back to its original semantic addressing. Returns false (no-op) if there
-// is no such mapping - the packet is then forwarded unchanged.
-func (proxy *GoProxyTunnel) ingoingProxy(pkt *iputils.Packet) bool {
-	// The reply is addressed to the namespace IP and port the flow left from,
-	// and sourced from the instance IP and port it was sent to.
-	entry, exist := proxy.proxycache.RetrieveByInstanceIp(
-		pkt.Protocol(), pkt.DstIP(), int(pkt.DstPort()), pkt.SrcIP(), int(pkt.SrcPort()))
-	if !exist {
-		return false
-	}
-
-	// Reverse conversion
-	return pkt.Rewrite(entry.dstServiceIp, entry.srcip)
 }
 
 // Enable listening to outgoing packets
 // if the goroutine must be stopped, send true to the stop channel
 // when the channels finish listening a "true" is sent back to the finish channel
 // in case of fatal error they are routed back to the err channel
-func (proxy *GoProxyTunnel) tunOutgoingListen() {
+func (t *Tunnel) tunOutgoingListen() {
 	readerror := make(chan error)
 
 	// async reader+processor
-	go proxy.outgoingLoop(readerror)
+	go t.outgoingLoop(readerror)
 
-	proxy.isListening = true
+	t.isListening = true
 	logger.InfoLogger().Println("GoProxyTunnel outgoing listening started")
 	for {
 		select {
-		case stopmsg := <-proxy.stopChannel:
+		case stopmsg := <-t.stopChannel:
 			if stopmsg {
 				logger.DebugLogger().Println("Outgoing listener received stop message")
-				proxy.isListening = false
-				proxy.finishChannel <- true
+				t.isListening = false
+				t.finishChannel <- true
 				return
 			}
 		case errormsg := <-readerror:
-			proxy.errorChannel <- errormsg
+			t.errorChannel <- errormsg
 		}
 	}
 }
@@ -561,177 +195,456 @@ func (proxy *GoProxyTunnel) tunOutgoingListen() {
 // if the goroutine must be stopped, send true to the stop channel
 // when the channels finish listening a "true" is sent back to the finish channel
 // in case of fatal error they are routed back to the err channel
-func (proxy *GoProxyTunnel) tunIngoingListen() {
+func (t *Tunnel) tunIngoingListen() {
 	readerror := make(chan error)
 
 	// async reader+processor
-	go proxy.ingoingLoop(readerror)
+	go t.ingoingLoop(readerror)
 
-	proxy.isListening = true
+	t.isListening = true
 	logger.InfoLogger().Println("GoProxyTunnel ingoing listening started")
 	for {
 		select {
-		case stopmsg := <-proxy.stopChannel:
+		case stopmsg := <-t.stopChannel:
 			if stopmsg {
 				logger.DebugLogger().Println("Ingoing listener received stop message")
-				_ = proxy.listenConnection.Close()
-				proxy.isListening = false
-				proxy.finishChannel <- true
+				_ = t.sock.Close()
+				t.isListening = false
+				t.finishChannel <- true
 				return
 			}
 		case errormsg := <-readerror:
-			proxy.errorChannel <- errormsg
+			t.errorChannel <- errormsg
 		}
 	}
 }
 
-// outgoingLoop reads packets from the TUN device and processes them
-// synchronously, one at a time, reusing a pooled buffer for each read.
-func (proxy *GoProxyTunnel) outgoingLoop(errchannel chan<- error) {
+// outgoingBatchGroup collects the packets one outgoingBatch grouped for a
+// single remote destination, so sendOverTunnelBatch can resolve dst's
+// tunnelConn once and write the whole group instead of once per packet.
+type outgoingBatchGroup struct {
+	dst  netip.AddrPort
+	gen  uint64
+	bufs [][]byte
+}
+
+// outgoingBatch holds the fixed set of buffers the outgoing loop reuses
+// across every read - mirroring ingoingBatch, see batchPacketCap - plus the
+// state that groups one read's ActionForward packets by destination. Unlike
+// the ingoing side, one read can be bound for several different peers, so
+// grouping is the whole point here: groupOf and groups only ever grow (never
+// get cleared or reallocated) as new destinations are seen, and gen
+// distinguishes "touched this batch" from "leftover from an older one"
+// without walking either structure between reads - see group.
+type outgoingBatch struct {
+	envelopes [][]byte
+	bufs      [][]byte
+	sizes     []int
+
+	deliverable [][]byte // ActionDeliver packets, collected for one tun.WriteBatch
+
+	groupOf map[netip.AddrPort]int // dst -> index into groups
+	groups  []outgoingBatchGroup
+	active  []int // indices into groups touched this batch, in first-seen order
+	gen     uint64
+
+	msgs []ipv4.Message // scratch for sendOverTunnelBatch - see writeMessages
+}
+
+func newOutgoingBatch(size int) *outgoingBatch {
+	if size < 1 {
+		size = 1
+	}
+	b := &outgoingBatch{
+		envelopes:   make([][]byte, size),
+		bufs:        make([][]byte, size),
+		sizes:       make([]int, size),
+		deliverable: make([][]byte, 0, size),
+		groupOf:     make(map[netip.AddrPort]int),
+	}
+	for i := range b.envelopes {
+		b.envelopes[i] = make([]byte, tunHeaderOffset+batchPacketCap)
+		// Unlike ingoingBatch.bufs (fed to TunnelSocket.ReadBatch, which has
+		// no header offset to apply), bufs here is fed straight to
+		// TunDevice.ReadBatch, whose contract is the full envelope - offset
+		// and all, see TunDevice - since the offset is applied inside it.
+		b.bufs[i] = b.envelopes[i]
+	}
+	return b
+}
+
+// group appends packet to the batch's group for dst, creating or recycling a
+// group slot as needed, and records dst as touched this batch (see active).
+// packet aliases one of b.envelopes' buffers, so it stays valid only until
+// the next ReadBatch - callers must drain active before then.
+func (b *outgoingBatch) group(dst netip.AddrPort, packet []byte) {
+	idx, exists := b.groupOf[dst]
+	if exists && b.groups[idx].gen == b.gen {
+		b.groups[idx].bufs = append(b.groups[idx].bufs, packet)
+		return
+	}
+	if !exists {
+		idx = len(b.groups)
+		b.groups = append(b.groups, outgoingBatchGroup{})
+		b.groupOf[dst] = idx
+	}
+	g := &b.groups[idx]
+	g.dst = dst
+	g.gen = b.gen
+	g.bufs = append(g.bufs[:0], packet)
+	b.active = append(b.active, idx)
+}
+
+// writeMessages resizes b.msgs to len(bufs) and points each message's single
+// buffer at the corresponding packet. Addr is left nil throughout - every
+// destination here is a connected tunnelConn (see newTunnelConn), so
+// WriteBatch always sends to the peer the socket is already dialled to. Both
+// the outer slice and each message's inner Buffers slice are reused across
+// every call: sendOverTunnelBatch only ever runs on the single outgoing-loop
+// goroutine, so nothing here needs to be safe for concurrent use.
+func (b *outgoingBatch) writeMessages(bufs [][]byte) []ipv4.Message {
+	for len(b.msgs) < len(bufs) {
+		b.msgs = append(b.msgs, ipv4.Message{Buffers: make([][]byte, 1)})
+	}
+	msgs := b.msgs[:len(bufs)]
+	for i, buf := range bufs {
+		msgs[i].Buffers[0] = buf
+		msgs[i].Addr = nil
+		msgs[i].N = 0
+	}
+	return msgs
+}
+
+// runOutgoingBatch performs one read-decide-send cycle: one TunDevice read,
+// Datapath.Handle for everything it returned, and - the whole point of
+// batching - at most one TunDevice.WriteBatch for whatever needed local
+// delivery plus one tunnel write per distinct remote destination, instead of
+// one write per packet either way. It returns the read error, if any; a
+// send/write error is only logged here, matching Emit's existing behaviour
+// for the same case (sendOverTunnelBatch itself still redials and retries a
+// failed send - see there).
+func (t *Tunnel) runOutgoingBatch(b *outgoingBatch) error {
+	n, err := t.tun.ReadBatch(b.bufs, b.sizes)
+	if err != nil {
+		return err
+	}
+
+	b.deliverable = b.deliverable[:0]
+	b.active = b.active[:0]
+	b.gen++
+
+	for i := 0; i < n; i++ {
+		packet := b.envelopes[i][tunHeaderOffset : tunHeaderOffset+b.sizes[i]]
+		switch action := t.dp.Handle(Outgoing, packet); action.Kind {
+		case ActionDrop:
+		case ActionDeliver:
+			// action.Packet aliases packet (see Handle's contract), and packet
+			// already sits in a buffer with the TUN device's header room
+			// reserved before it - unlike Emit's ActionDeliver case, which
+			// copies for exactly that reason, this can go straight back with
+			// no copy.
+			b.deliverable = append(b.deliverable, b.envelopes[i][:tunHeaderOffset+b.sizes[i]])
+		case ActionForward:
+			b.group(action.Dst, action.Packet)
+		default:
+			// Handle(Outgoing, ...) only ever returns Deliver, Forward or
+			// Drop - never trust that silently, since acting on anything else
+			// here would mean grouping garbage into a send.
+			logger.ErrorLogger().Println("outgoing datapath returned an unexpected action:", action.Kind)
+		}
+	}
+
+	if len(b.deliverable) > 0 {
+		if _, err := t.tun.WriteBatch(b.deliverable); err != nil {
+			logger.ErrorLogger().Println(err)
+		}
+	}
+
+	// Groups are drained after both the read and the delivery write are done
+	// with the batch's buffers - sendOverTunnelBatch may block briefly on
+	// redial, and holding TUN writes on that would only slow this loop down,
+	// not the groups it hasn't gotten to yet.
+	for _, idx := range b.active {
+		g := &b.groups[idx]
+		t.sendOverTunnelBatch(g.dst, g.bufs, b, 0)
+	}
+	return nil
+}
+
+// outgoingLoop reads batches of packets off the TUN device and, per read,
+// forwards them with as few writes as the batch's shape allows: one
+// TunDevice.WriteBatch for everything needing local delivery, and one tunnel
+// write per distinct remote destination - see runOutgoingBatch.
+func (t *Tunnel) outgoingLoop(errchannel chan<- error) {
+	batch := newOutgoingBatch(t.tun.BatchSize())
 	for {
-		buf := getPacketBuf()
-		n, err := proxy.ifce.Read(*buf)
-		if err != nil {
-			putPacketBuf(buf)
+		if err := t.runOutgoingBatch(batch); err != nil {
 			errchannel <- err
-			continue
 		}
-		proxy.handleOutgoing((*buf)[:n], true)
-		putPacketBuf(buf)
 	}
 }
 
-// ingoingLoop reads packets from the tunnel UDP socket and processes them
-// synchronously, one at a time, reusing a pooled buffer for each read.
-func (proxy *GoProxyTunnel) ingoingLoop(errchannel chan<- error) {
+// ingoingBatch holds the fixed set of buffers the ingoing loop reuses across
+// every read - see batchPacketCap for why it isn't sized like
+// packetReadBufferSize's pool. envelopes are the full buffers (headroom included);
+// bufs are the same buffers pre-sliced past the headroom, which is all
+// TunnelSocket ever needs to see.
+type ingoingBatch struct {
+	envelopes   [][]byte
+	bufs        [][]byte
+	sizes       []int
+	deliverable [][]byte
+}
+
+func newIngoingBatch(size int) *ingoingBatch {
+	if size < 1 {
+		size = 1
+	}
+	b := &ingoingBatch{
+		envelopes:   make([][]byte, size),
+		bufs:        make([][]byte, size),
+		sizes:       make([]int, size),
+		deliverable: make([][]byte, 0, size),
+	}
+	for i := range b.envelopes {
+		b.envelopes[i] = make([]byte, tunHeaderOffset+batchPacketCap)
+		b.bufs[i] = b.envelopes[i][tunHeaderOffset:]
+	}
+	return b
+}
+
+// runIngoingBatch performs one read-decide-write cycle: one TunnelSocket
+// read, Datapath.Handle for everything it returned, and - the whole point of
+// batching - at most one TunDevice write for everything that needed
+// delivering, instead of one write per packet. It returns the read error, if
+// any; a write error is only logged, matching Emit's existing behaviour for
+// the same case.
+func (t *Tunnel) runIngoingBatch(b *ingoingBatch) error {
+	n, err := t.sock.ReadBatch(b.bufs, b.sizes)
+	if err != nil {
+		return err
+	}
+
+	b.deliverable = b.deliverable[:0]
+	for i := 0; i < n; i++ {
+		packet := b.envelopes[i][tunHeaderOffset : tunHeaderOffset+b.sizes[i]]
+		switch action := t.dp.Handle(Ingoing, packet); action.Kind {
+		case ActionDrop:
+		case ActionDeliver:
+			b.deliverable = append(b.deliverable, b.envelopes[i][:tunHeaderOffset+b.sizes[i]])
+		default:
+			// Handle(Ingoing, ...) only ever returns Deliver or Drop - never
+			// trust that silently, since acting on a Forward here would mean
+			// writing a still-addressed-for-the-network packet to the TUN
+			// device instead of sending it.
+			logger.ErrorLogger().Println("ingoing datapath returned an unexpected action:", action.Kind)
+		}
+	}
+
+	if len(b.deliverable) > 0 {
+		if _, err := t.tun.WriteBatch(b.deliverable); err != nil {
+			logger.ErrorLogger().Println(err)
+		}
+	}
+	return nil
+}
+
+// ingoingLoop reads batches of packets off the tunnel UDP socket and, for
+// whatever needs delivering to the TUN device, writes them back in a single
+// batched call - see runIngoingBatch.
+func (t *Tunnel) ingoingLoop(errchannel chan<- error) {
+	batch := newIngoingBatch(t.tun.BatchSize())
 	for {
-		buf := getPacketBuf()
-		n, _, err := proxy.listenConnection.ReadFromUDP(*buf)
-		if err != nil {
-			putPacketBuf(buf)
+		if err := t.runIngoingBatch(batch); err != nil {
 			errchannel <- err
-			continue
 		}
-		proxy.handleIngoing((*buf)[:n])
-		putPacketBuf(buf)
 	}
 }
 
-// forward sends packetBytes to dstHost:dstPort over the tunnel, or - if the
-// destination is this machine - hands it straight to the ingoing pipeline
-// without going over the network at all.
-func (proxy *GoProxyTunnel) forward(dstHost netip.Addr, dstPort int, packetBytes []byte, attemptNumber int) {
+// connFor resolves dst's tunnelConn, dialling and storing a new one if none
+// exists yet. Shared by sendOverTunnel and sendOverTunnelBatch so both agree
+// on how a peer connection comes into existence.
+func (t *Tunnel) connFor(dst netip.AddrPort) (*tunnelConn, error) {
+	t.connectionBufferLock.RLock()
+	con, exist := t.connectionBuffer[dst]
+	t.connectionBufferLock.RUnlock()
+	if exist {
+		return con, nil
+	}
+	return t.dialAndStore(dst)
+}
+
+// evictDeadConn removes con from connectionBuffer if it is still the entry
+// for dst, so dialAndStore's double-check doesn't just hand a failed
+// connection straight back. Guarded on identity, as in evictIdleConnections:
+// another goroutine may have already replaced it with a live connection by
+// the time a failed write gets here.
+func (t *Tunnel) evictDeadConn(dst netip.AddrPort, con *tunnelConn) {
+	t.connectionBufferLock.Lock()
+	if t.connectionBuffer[dst] == con {
+		delete(t.connectionBuffer, dst)
+	}
+	t.connectionBufferLock.Unlock()
+}
+
+// sendOverTunnel sends packetBytes to dst over the tunnel. The local-delivery
+// shortcut and the invalid-host check happen in Datapath.forwardResult before
+// an Action ever reaches here, so dst is always a real remote peer.
+func (t *Tunnel) sendOverTunnel(dst netip.AddrPort, packetBytes []byte, attemptNumber int) {
 	if attemptNumber > 10 {
 		return
 	}
 
-	// If destination host is this machine, forward packet directly to the ingoing traffic method
-	if dstHost == proxy.localIP {
-		if logger.IsDebug() {
-			logger.DebugLogger().Println("Packet forwarded locally")
-		}
-		proxy.handleIngoing(packetBytes)
+	con, err := t.connFor(dst)
+	if err != nil {
 		return
-	}
-
-	if !dstHost.IsValid() {
-		logger.ErrorLogger().Println("Invalid destination host:", dstHost)
-		return
-	}
-	key := netip.AddrPortFrom(dstHost, uint16(dstPort))
-
-	proxy.connectionBufferLock.RLock()
-	con, exist := proxy.connectionBuffer[key]
-	proxy.connectionBufferLock.RUnlock()
-
-	if !exist {
-		var err error
-		con, err = proxy.dialAndStore(key)
-		if err != nil {
-			return
-		}
 	}
 
 	con.lastUsed.Store(coarseClock.Load())
 
 	// net.UDPConn is safe for concurrent use - no lock needed around the
-	// write itself, only around the map lookup above.
-	_, err := con.conn.Write(packetBytes)
-	if err != nil {
+	// write itself, only around connection resolution above.
+	if _, err := con.conn.Write(packetBytes); err != nil {
 		_ = con.conn.Close()
 		logger.ErrorLogger().Println(err)
 
-		// con is confirmed dead - evict it so dialAndStore's double-check
-		// doesn't just hand it straight back. Guard on identity: another
-		// goroutine may have already replaced it with a live connection.
-		proxy.connectionBufferLock.Lock()
-		if proxy.connectionBuffer[key] == con {
-			delete(proxy.connectionBuffer, key)
-		}
-		proxy.connectionBufferLock.Unlock()
+		// con is confirmed dead - evict it before redialling.
+		t.evictDeadConn(dst, con)
 
-		if _, err := proxy.dialAndStore(key); err != nil {
+		if _, err := t.dialAndStore(dst); err != nil {
 			return
 		}
 		// Try again
-		proxy.forward(dstHost, dstPort, packetBytes, attemptNumber+1)
+		t.sendOverTunnel(dst, packetBytes, attemptNumber+1)
+	}
+}
+
+// sendOverTunnelBatch sends bufs to dst, resolving dst's tunnelConn once for
+// the whole group instead of once per packet - the amortisation this whole
+// change is for - and writing them with as few WriteBatch calls as the
+// connection's platform allows (see batchWriter). scratch is where messages
+// are built for the underlying WriteBatch call; the caller (runOutgoingBatch)
+// owns it and reuses it across every destination and every batch, so this
+// never allocates in steady state.
+//
+// A write failure redials exactly as sendOverTunnel does: the dead connection
+// is evicted, a fresh one is dialled, and whatever of the group didn't make
+// it out yet is retried on it, up to the same 10-retry cap - so one peer
+// being down costs that peer's group some latency, never the other groups in
+// the same batch, which are already independent loop iterations by the time
+// this runs (see runOutgoingBatch). A platform whose WriteBatch can only ever
+// accept one message per call (see ipv4/ipv6's doc on that) is not a
+// failure - the loop just keeps calling it until the group drains.
+func (t *Tunnel) sendOverTunnelBatch(dst netip.AddrPort, bufs [][]byte, scratch *outgoingBatch, attemptNumber int) {
+	if attemptNumber > 10 || len(bufs) == 0 {
+		return
+	}
+
+	con, err := t.connFor(dst)
+	if err != nil {
+		return
+	}
+	con.lastUsed.Store(coarseClock.Load())
+
+	for len(bufs) > 0 {
+		sent, err := con.batch.WriteBatch(scratch.writeMessages(bufs), 0)
+		bufs = bufs[sent:]
+		if err == nil {
+			if sent == 0 {
+				// WriteBatch's contract only promises this can happen on
+				// error - treat a silent no-op the same way rather than
+				// spinning on the rest of the group forever.
+				return
+			}
+			continue
+		}
+
+		_ = con.conn.Close()
+		logger.ErrorLogger().Println(err)
+		t.evictDeadConn(dst, con)
+
+		if _, err := t.dialAndStore(dst); err != nil {
+			return
+		}
+		// Retry only what didn't make it out before the failure.
+		t.sendOverTunnelBatch(dst, bufs, scratch, attemptNumber+1)
+		return
 	}
 }
 
 // dialAndStore installs a fresh connection for key, unless another goroutine
-// won the race to create one first - forward() can now run on several
+// won the race to create one first - sendOverTunnel can now run on several
 // goroutines at once (see retainForReplay), and dropping a duplicate on the
 // floor would leak its socket.
-func (proxy *GoProxyTunnel) dialAndStore(key netip.AddrPort) (*tunnelConn, error) {
+func (t *Tunnel) dialAndStore(key netip.AddrPort) (*tunnelConn, error) {
 	connection, err := createUDPChannel(key)
 	if err != nil {
 		return nil, err
 	}
 
-	proxy.connectionBufferLock.Lock()
-	defer proxy.connectionBufferLock.Unlock()
-	if existing, exist := proxy.connectionBuffer[key]; exist {
+	t.connectionBufferLock.Lock()
+	defer t.connectionBufferLock.Unlock()
+	if existing, exist := t.connectionBuffer[key]; exist {
 		_ = connection.Close()
 		return existing, nil
 	}
-	tc := &tunnelConn{conn: connection}
-	tc.lastUsed.Store(coarseClock.Load())
-	proxy.connectionBuffer[key] = tc
+	tc := newTunnelConn(connection, key)
+	t.connectionBuffer[key] = tc
 	return tc, nil
+}
+
+// newTunnelConn wraps a freshly dialled peer connection with the batched
+// writer its address family needs. Unlike the listen socket - always
+// dual-stack, see udpTunnelSocket - a socket net.DialUDP dials to one
+// specific remote address is single-family, and dst.Addr() is never a
+// v4-mapped v6 address here (see TableEntryCache.AddrFromIP's Unmap), so
+// checking Is4() reliably tells the two apart. A node can have peers of both
+// kinds at once, which is why this is decided per connection rather than
+// once for the whole Tunnel.
+func newTunnelConn(conn *net.UDPConn, dst netip.AddrPort) *tunnelConn {
+	var bw batchWriter
+	if dst.Addr().Is4() {
+		bw = ipv4.NewPacketConn(conn)
+	} else {
+		bw = ipv6.NewPacketConn(conn)
+	}
+	tc := &tunnelConn{conn: conn, batch: bw}
+	tc.lastUsed.Store(coarseClock.Load())
+	return tc
 }
 
 // startConnectionEviction closes tunnel sockets that have gone unused, so the
 // descriptor and socket-buffer cost of talking to a node once doesn't persist
 // for the lifetime of the process.
-func (proxy *GoProxyTunnel) startConnectionEviction() {
+func (t *Tunnel) startConnectionEviction() {
 	ticker := time.NewTicker(connectionSweepInterval)
 	go func() {
 		for range ticker.C {
-			proxy.evictIdleConnections(connectionIdleTimeout)
+			t.evictIdleConnections(connectionIdleTimeout)
 		}
 	}()
 }
 
-func (proxy *GoProxyTunnel) evictIdleConnections(timeout time.Duration) {
+func (t *Tunnel) evictIdleConnections(timeout time.Duration) {
 	cutoff := coarseClock.Load() - int64(timeout.Seconds())
 
 	// Collect first, then close outside the lock: Close can block, and the
 	// datapath needs this map back.
 	var idle []*tunnelConn
-	proxy.connectionBufferLock.Lock()
-	for key, con := range proxy.connectionBuffer {
+	t.connectionBufferLock.Lock()
+	for key, con := range t.connectionBuffer {
 		if con.lastUsed.Load() > cutoff {
 			continue
 		}
-		// Identity check, as in forward()'s error path: only remove the
+		// Identity check, as in sendOverTunnel's error path: only remove the
 		// connection actually observed as idle, never a replacement that has
 		// since been dialled for the same peer.
-		if proxy.connectionBuffer[key] == con {
-			delete(proxy.connectionBuffer, key)
+		if t.connectionBuffer[key] == con {
+			delete(t.connectionBuffer, key)
 			idle = append(idle, con)
 		}
 	}
-	proxy.connectionBufferLock.Unlock()
+	t.connectionBufferLock.Unlock()
 
 	for _, con := range idle {
 		_ = con.conn.Close()
@@ -754,23 +667,23 @@ func createUDPChannel(raddr netip.AddrPort) (*net.UDPConn, error) {
 }
 
 // GetName returns the name of the tun interface
-func (proxy *GoProxyTunnel) GetName() string {
-	return proxy.HostTUNDeviceName
+func (t *Tunnel) GetName() string {
+	return t.HostTUNDeviceName
 }
 
 // GetErrCh returns the error channel
 // this channel sends all the errors of the tun device
-func (proxy *GoProxyTunnel) GetErrCh() <-chan error {
-	return proxy.errorChannel
+func (t *Tunnel) GetErrCh() <-chan error {
+	return t.errorChannel
 }
 
 // GetStopCh returns the errCh
 // this channel is used to stop the service. After a shutdown the TUN device stops listening
-func (proxy *GoProxyTunnel) GetStopCh() chan<- bool {
-	return proxy.stopChannel
+func (t *Tunnel) GetStopCh() chan<- bool {
+	return t.stopChannel
 }
 
 // GetFinishCh returns the confirmation that the channel stopped listening for packets
-func (proxy *GoProxyTunnel) GetFinishCh() <-chan bool {
-	return proxy.finishChannel
+func (t *Tunnel) GetFinishCh() <-chan bool {
+	return t.finishChannel
 }
