@@ -2,19 +2,17 @@ package proxy
 
 import (
 	"net"
-	"net/netip"
 
 	"golang.org/x/net/ipv6"
 )
 
 // TunnelSocket abstracts the tunnel's listen socket: batched reads off it
-// (recvmmsg, where the kernel supports it) and destination-addressed writes
-// to a peer. dst is a parameter of WriteBatch - unlike TunDevice, which has
-// none - because unlike the TUN end, every tunnel write has one specific
-// peer; the TUN end has no destination to speak of.
+// (recvmmsg, where the kernel supports it). Sending to a peer never goes
+// through this socket - every outgoing send has a specific peer, and that
+// traffic goes out over connectionBuffer's per-peer dialled connections
+// instead (see Tunnel.sendOverTunnelBatch and tunnelConn.batch).
 type TunnelSocket interface {
 	ReadBatch(bufs [][]byte, sizes []int) (int, error)
-	WriteBatch(dst netip.AddrPort, bufs [][]byte) (int, error)
 	Close() error
 }
 
@@ -65,22 +63,6 @@ func (s *udpTunnelSocket) ReadBatch(bufs [][]byte, sizes []int) (int, error) {
 		sizes[i] = msgs[i].N
 	}
 	return n, nil
-}
-
-// WriteBatch loops over single writes. This socket is not where outgoing
-// batching happens - every send here would need its own destination address
-// regardless of grouping, and the actual per-peer traffic goes out over
-// connectionBuffer's dialled connections instead (see
-// Tunnel.sendOverTunnelBatch and tunnelConn.batch); this only has to be
-// correct.
-func (s *udpTunnelSocket) WriteBatch(dst netip.AddrPort, bufs [][]byte) (int, error) {
-	addr := net.UDPAddrFromAddrPort(dst)
-	for i, b := range bufs {
-		if _, err := s.conn.WriteToUDP(b, addr); err != nil {
-			return i, err
-		}
-	}
-	return len(bufs), nil
 }
 
 func (s *udpTunnelSocket) Close() error {
