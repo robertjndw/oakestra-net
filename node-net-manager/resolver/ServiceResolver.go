@@ -50,6 +50,9 @@ type ServiceResolver struct {
 	failedServiceIPs map[netip.Addr]time.Time     // ServiceIP -> when resolution last failed
 	// nil selects the real MQTT round trip; tests substitute a stub
 	tableQuery func(netip.Addr) ([]TableEntryCache.TableEntry, error)
+	// nil registers through MQTT; tests substitute a recorder so the successful
+	// resolution path can be exercised without a live broker/client.
+	interestRegistrar func(string)
 }
 
 // New builds a ServiceResolver. deployments may be nil in tests that don't exercise MQTT interest bookkeeping.
@@ -205,9 +208,17 @@ func (r *ServiceResolver) resolveServiceIP(addr netip.Addr) error {
 		return err
 	}
 
-	mqtt.MqttRegisterInterest(jobName, r)
-	mqtt.MqttRegisterInterest(addr.String(), r) // avoid re-querying this address too
+	r.registerInterest(jobName)
+	r.registerInterest(addr.String()) // avoid re-querying this address too
 	return nil
+}
+
+func (r *ServiceResolver) registerInterest(target string) {
+	if r.interestRegistrar != nil {
+		r.interestRegistrar(target)
+		return
+	}
+	mqtt.MqttRegisterInterest(target, r)
 }
 
 // resolvesServiceIP reports whether any entry actually advertises addr as one

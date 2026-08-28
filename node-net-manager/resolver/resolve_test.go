@@ -2,9 +2,11 @@ package resolver
 
 import (
 	"NetManager/TableEntryCache"
+	"NetManager/events"
 	"errors"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -100,6 +102,115 @@ func TestNegativeCacheExpires(t *testing.T) {
 		t.Fatal("expected a retry once the negative-cache TTL had passed")
 	}
 	<-done
+}
+
+// A successful cold lookup must be shared by every packet waiting on the same
+// Service IP, install the complete response, and turn later lookups into local
+// cache hits. The proxy replay tests cover what happens after Resolving closes;
+// this test covers the real resolver on the other side of that channel.
+func TestSuccessfulLookupInstallsAndReusesResolvedEntries(t *testing.T) {
+	const (
+		job = "app.ns.svc.svcns"
+		vip = "10.30.9.9"
+	)
+	addr := netip.MustParseAddr(vip)
+	events.Delete(job)
+	t.Cleanup(func() { events.Delete(job) })
+
+	firstEntry := resolvableEntry(job, vip)
+	secondEntry := resolvableEntry(job, vip)
+	secondEntry.Instancenumber = 1
+	secondEntry.Nsip = net.ParseIP("10.19.1.2")
+	secondEntry.Nsipv6 = net.ParseIP("fc00::2")
+
+	queryStarted := make(chan struct{}, 1)
+	releaseQuery := make(chan struct{})
+	interests := make(chan string, 64)
+	var queries atomic.Int32
+	r := &ServiceResolver{
+		translationTable: TableEntryCache.NewTableManager(),
+		tableQuery: func(got netip.Addr) ([]TableEntryCache.TableEntry, error) {
+			if got != addr {
+				t.Errorf("queried %s; want %s", got, addr)
+			}
+			queries.Add(1)
+			select {
+			case queryStarted <- struct{}{}:
+			default:
+			}
+			<-releaseQuery
+			return []TableEntryCache.TableEntry{firstEntry, secondEntry}, nil
+		},
+		interestRegistrar: func(target string) {
+			interests <- target
+		},
+	}
+
+	first := r.GetTableEntryByServiceIP(addr)
+	if len(first.Entries) != 0 || first.Resolving == nil {
+		t.Fatalf("cold lookup = %+v; want no entries and an in-flight resolution", first)
+	}
+	select {
+	case <-queryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the table query to start")
+	}
+
+	// A burst behind the same cold VIP must join the existing query rather than
+	// starting one MQTT round trip per packet.
+	for i := 0; i < 16; i++ {
+		lookup := r.GetTableEntryByServiceIP(addr)
+		if lookup.Resolving != first.Resolving {
+			t.Fatalf("lookup %d received a different resolution channel", i)
+		}
+	}
+	if got := queries.Load(); got != 1 {
+		t.Fatalf("started %d table queries for one Service IP; want 1", got)
+	}
+
+	close(releaseQuery)
+	select {
+	case <-first.Resolving:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the successful resolution")
+	}
+
+	activity := events.GetOrCreate(job)
+	if idle := activity.IdleFor(); idle != time.Duration(1<<63-1) {
+		t.Fatalf("activity was touched before the first cache hit: idle for %v", idle)
+	}
+	lookup := r.GetTableEntryByServiceIP(addr)
+	if lookup.Resolving != nil {
+		t.Error("a resolved lookup still reports an in-flight query")
+	}
+	if len(lookup.Entries) != 2 {
+		t.Fatalf("installed %d entries; want the complete 2-entry response", len(lookup.Entries))
+	}
+	if lookup.Generation == 0 {
+		t.Error("resolved entries were returned without a table generation")
+	}
+	if got := queries.Load(); got != 1 {
+		t.Errorf("cache hit started another table query; total queries = %d", got)
+	}
+	if activity.IdleFor() == time.Duration(1<<63-1) {
+		t.Error("the cache hit did not touch the job activity tracker")
+	}
+
+	for i, want := range []string{job, vip} {
+		select {
+		case got := <-interests:
+			if got != want {
+				t.Errorf("interest %d registered for %q; want %q", i, got, want)
+			}
+		default:
+			t.Fatalf("interest %d for %q was not registered", i, want)
+		}
+	}
+	select {
+	case extra := <-interests:
+		t.Errorf("unexpected extra interest registered for %q", extra)
+	default:
+	}
 }
 
 // a rejected response must not displace the existing route sharing its namespace IP
