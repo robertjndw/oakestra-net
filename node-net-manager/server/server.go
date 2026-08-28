@@ -46,10 +46,13 @@ func update() {
 			logger.InfoLogger().Printf("Updating NodePublicAddress from %s to %s", model.NetConfig.NodePublicAddress, defaultLink.String())
 			// update service in the cluster
 			//for each service instance in the worker, update the public address
-			for _, si := range Env.GetTableEntriesOnNode() {
-				err := mqtt.NotifyAddressChange(si.Appname, si.Instancenumber, defaultLink.String(), model.NetConfig.NodePublicPort)
-				if err != nil {
-					logger.ErrorLogger().Println("[ERROR]:", err)
+			// this timer can fire before /register has created Env
+			if Env != nil {
+				for _, si := range Env.GetTableEntriesOnNode() {
+					err := mqtt.NotifyAddressChange(si.Appname, si.Instancenumber, defaultLink.String(), model.NetConfig.NodePublicPort)
+					if err != nil {
+						logger.ErrorLogger().Println("[ERROR]:", err)
+					}
 				}
 			}
 			model.NetConfig.NodePublicAddress = defaultLink.String()
@@ -68,7 +71,7 @@ func HandleRequests(port int) {
 		go update()
 	}
 
-	handlers.RegisterAllManagers(Env, &model.WorkerID, model.NetConfig.NodePublicAddress, model.NetConfig.NodePublicPort, netRouter)
+	handlers.RegisterAllManagers(&model.WorkerID, model.NetConfig.NodePublicAddress, model.NetConfig.NodePublicPort, netRouter)
 
 	if port <= 0 {
 		logger.InfoLogger().Println("Starting NetManager on unix socket /etc/netmanager/netmanager.sock")
@@ -156,6 +159,8 @@ func register(writer http.ResponseWriter, request *http.Request) {
 	Env = env.NewEnvironmentClusterConfigured(Proxy.HostTUNDeviceName)
 
 	Proxy.SetResolver(Env.Resolver())
+
+	handlers.SetEnvironmentForAllManagers(Env)
 
 	logger.InfoLogger().Printf("NetManager is now running 🟢")
 	writer.WriteHeader(http.StatusOK)
