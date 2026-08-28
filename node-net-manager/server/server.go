@@ -153,12 +153,14 @@ func register(writer http.ResponseWriter, request *http.Request) {
 		log.Fatalf("Unable to parse the local IP %q: %s", ipstring, err)
 	}
 	Proxy = proxy.New(localIP)
-	Proxy.Listen()
 
 	// initialize the Env Manager
 	Env = env.NewEnvironmentClusterConfigured(Proxy.HostTUNDeviceName)
 
+	// The resolver must be wired up before the read loops start, so Datapath
+	// never sees a nil resolver on the packet path.
 	Proxy.SetResolver(Env.Resolver())
+	Proxy.Listen()
 
 	handlers.SetEnvironmentForAllManagers(Env)
 

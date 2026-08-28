@@ -489,34 +489,13 @@ func (t *Tunnel) evictDeadConn(dst netip.AddrPort, con *tunnelConn) {
 
 // sendOverTunnel sends packetBytes to dst over the tunnel. The local-delivery
 // shortcut and the invalid-host check happen in Datapath.forwardResult before
-// an Action ever reaches here, so dst is always a real remote peer.
+// an Action ever reaches here, so dst is always a real remote peer. It's a
+// single-packet call onto sendOverTunnelBatch's connect/write/retry logic;
+// unlike runOutgoingBatch's calls, this can run on several replay goroutines
+// at once (see retainForReplay), so it can't share runOutgoingBatch's
+// scratch outgoingBatch and gets its own per-call instead.
 func (t *Tunnel) sendOverTunnel(dst netip.AddrPort, packetBytes []byte, attemptNumber int) {
-	if attemptNumber > 10 {
-		return
-	}
-
-	con, err := t.connFor(dst)
-	if err != nil {
-		return
-	}
-
-	con.lastUsed.Store(coarseClock.Load())
-
-	// net.UDPConn is safe for concurrent use - no lock needed around the
-	// write itself, only around connection resolution above.
-	if _, err := con.conn.Write(packetBytes); err != nil {
-		_ = con.conn.Close()
-		logger.ErrorLogger().Println(err)
-
-		// con is confirmed dead - evict it before redialling.
-		t.evictDeadConn(dst, con)
-
-		if _, err := t.dialAndStore(dst); err != nil {
-			return
-		}
-		// Try again
-		t.sendOverTunnel(dst, packetBytes, attemptNumber+1)
-	}
+	t.sendOverTunnelBatch(dst, [][]byte{packetBytes}, &outgoingBatch{}, attemptNumber)
 }
 
 // sendOverTunnelBatch sends bufs to dst, resolving dst's tunnelConn once for

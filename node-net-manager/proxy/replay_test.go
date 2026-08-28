@@ -5,7 +5,6 @@ import (
 	"NetManager/proxy/iputils"
 	"NetManager/resolver"
 	"bytes"
-	"net"
 	"net/netip"
 	"sync"
 	"testing"
@@ -59,10 +58,6 @@ func (e *resolvingEnv) GetTableEntryByServiceIP(addr netip.Addr) resolver.Servic
 
 func (e *resolvingEnv) GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool) {
 	return e.table.SearchByNsIP(addr)
-}
-
-func (e *resolvingEnv) GetTableEntryByInstanceIP(net.IP) (TableEntryCache.TableEntry, bool) {
-	return TableEntryCache.TableEntry{}, false
 }
 
 // release completes the resolution attempt for addr. succeed=false models an

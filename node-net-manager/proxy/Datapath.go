@@ -158,18 +158,16 @@ func (d *Datapath) handleOutgoing(buf []byte, mayRetain bool) Action {
 // forwardResult turns a resolved destination into the Action the caller
 // should take: if the destination is this machine, the packet never has to
 // leave - hand it straight to the ingoing pipeline and return whatever that
-// decides, instead of round-tripping it over the network.
+// decides, instead of round-tripping it over the network. dstHost is always
+// valid here - both callers (outgoingProxy's route resolution and its cached
+// path) only ever hand back an address that already passed
+// TableEntryCache.AddrFromIP's validity check.
 func (d *Datapath) forwardResult(dstHost netip.Addr, dstPort int, packetBytes []byte) Action {
 	if dstHost == d.localIP {
 		if logger.IsDebug() {
 			logger.DebugLogger().Println("Packet forwarded locally")
 		}
 		return d.handleIngoing(packetBytes)
-	}
-
-	if !dstHost.IsValid() {
-		logger.ErrorLogger().Println("Invalid destination host:", dstHost)
-		return Action{Kind: ActionDrop}
 	}
 
 	return Action{

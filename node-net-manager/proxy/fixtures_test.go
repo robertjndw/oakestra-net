@@ -117,10 +117,6 @@ func (fakeenv *FakeEnv) GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.Ta
 	return fakeenv.table.SearchByNsIP(addr)
 }
 
-func (fakeenv *FakeEnv) GetTableEntryByInstanceIP(ip net.IP) (TableEntryCache.TableEntry, bool) {
-	return TableEntryCache.TableEntry{}, false
-}
-
 // replaceJob models a route refresh arriving from the cluster.
 func (fakeenv *FakeEnv) replaceJob(t testing.TB, job string, entries ...TableEntryCache.TableEntry) {
 	t.Helper()

@@ -36,7 +36,6 @@ type Resolver interface {
 	// trip and must never happen on the packet path - see resolveServiceIPOnce.
 	GetTableEntryByServiceIP(addr netip.Addr) ServiceLookup
 	GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool)
-	GetTableEntryByInstanceIP(ip net.IP) (TableEntryCache.TableEntry, bool)
 }
 
 // LocalDeployments answers whether a job is deployed on this node. It decouples
@@ -271,28 +270,6 @@ func (r *ServiceResolver) queryTable(addr netip.Addr) ([]TableEntryCache.TableEn
 		return r.tableQuery(addr)
 	}
 	return tableQueryByIP(addr)
-}
-
-// GetTableEntryByInstanceIP Given a ServiceIP this method performs a search in the local ServiceCache
-// If the entry is not present a TableQuery is performed and the interest registered
-func (r *ServiceResolver) GetTableEntryByInstanceIP(ip net.IP) (TableEntryCache.TableEntry, bool) {
-	addr, ok := TableEntryCache.AddrFromIP(ip)
-	if !ok {
-		return TableEntryCache.TableEntry{}, false
-	}
-	// If entry already available
-	table, _ := r.translationTable.SearchByServiceIP(addr)
-	if len(table) > 0 {
-		for elemindex, elem := range table {
-			for _, elemIp := range elem.ServiceIP {
-				if elemIp.IpType == TableEntryCache.InstanceNumber &&
-					(elemIp.Address.Equal(ip) || elemIp.Address_v6.Equal(ip)) {
-					return table[elemindex], true
-				}
-			}
-		}
-	}
-	return TableEntryCache.TableEntry{}, false
 }
 
 // GetTableEntryByNsIP Given a NamespaceIP finds the table entry. This search is local because the networking component MUST have all
