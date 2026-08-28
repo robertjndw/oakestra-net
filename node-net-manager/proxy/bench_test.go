@@ -13,11 +13,11 @@ import (
 func BenchmarkOutgoingProxyV4(b *testing.B) {
 	proxy := getFakeTunnel()
 	wire := buildTestPacketV4(b, "10.19.1.1", "10.30.255.255", 666, 80)
+	buf := make([]byte, len(wire))
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf := make([]byte, len(wire))
 		copy(buf, wire)
 		pkt, ok := iputils.Parse(buf)
 		if !ok || !pkt.HasTransport() {
@@ -32,11 +32,11 @@ func BenchmarkOutgoingProxyV4(b *testing.B) {
 func BenchmarkOutgoingProxyV6(b *testing.B) {
 	proxy := getFakeTunnel()
 	wire := buildTestPacketV6(b, "fc00::1", "fdff:2000::ff", 666, 80)
+	buf := make([]byte, len(wire))
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf := make([]byte, len(wire))
 		copy(buf, wire)
 		pkt, ok := iputils.Parse(buf)
 		if !ok || !pkt.HasTransport() {
@@ -59,11 +59,11 @@ func BenchmarkIngoingProxyV4(b *testing.B) {
 		dstport:       666,
 	})
 	wire := buildTestPacketV4(b, "10.30.0.5", "10.19.1.15", 666, 777)
+	buf := make([]byte, len(wire))
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf := make([]byte, len(wire))
 		copy(buf, wire)
 		pkt, ok := iputils.Parse(buf)
 		if !ok || !pkt.HasTransport() {

@@ -19,6 +19,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sync/singleflight"
 )
 
 const NamespaceAlreadyDeclared string = "namespace already declared"
@@ -50,11 +51,11 @@ type Environment struct {
 	proxyName         string
 	config            Configuration
 	translationTable  TableEntryCache.TableManager
-	// resolvingServiceIPs/failedServiceIPs dedup and rate-limit background
+	// resolveGroup/failedServiceIPs dedup and rate-limit background
 	// table-query resolution on a ServiceIP miss (see GetTableEntryByServiceIP).
-	// Zero value of sync.Map is ready to use, no constructor changes needed.
-	resolvingServiceIPs sync.Map // ip.String() -> struct{}, present while a query is in flight
-	failedServiceIPs    sync.Map // ip.String() -> time.Time of the last failed attempt
+	// Zero values are ready to use, no constructor changes needed.
+	resolveGroup     singleflight.Group // dedupes concurrent resolutions of the same ServiceIP
+	failedServiceIPs sync.Map           // ip.String() -> time.Time of the last failed attempt
 	//### Deployment management variables
 	deployedServices     map[string]service // all the deployed services with the ip and ports
 	deployedServicesLock sync.RWMutex
@@ -516,18 +517,19 @@ func (env *Environment) resolveServiceIPOnce(ip net.IP) {
 		}
 	}
 
-	if _, alreadyResolving := env.resolvingServiceIPs.LoadOrStore(key, struct{}{}); alreadyResolving {
-		return
-	}
-
-	go func() {
-		defer env.resolvingServiceIPs.Delete(key)
-		if err := env.resolveServiceIP(ip); err != nil {
+	// DoChan dedupes concurrent resolutions of the same key and runs the
+	// call in its own goroutine, so - like the sync.Map + go func it
+	// replaces - this never blocks the caller (the packet-handling
+	// goroutine, see GetTableEntryByServiceIP).
+	env.resolveGroup.DoChan(key, func() (interface{}, error) {
+		err := env.resolveServiceIP(ip)
+		if err != nil {
 			env.failedServiceIPs.Store(key, time.Now())
 		} else {
 			env.failedServiceIPs.Delete(key)
 		}
-	}()
+		return nil, err
+	})
 }
 
 // resolveServiceIP performs the actual (blocking) table query and populates

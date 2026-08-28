@@ -39,7 +39,7 @@ type TableEntry struct {
 }
 
 // Touch marks this entry's job as just used. Safe to call on every packet.
-func (e TableEntry) Touch() {
+func (e *TableEntry) Touch() {
 	if e.activity != nil {
 		e.activity.Touch()
 	}
@@ -188,23 +188,22 @@ func (t *TableManager) removeByIndex(index int) error {
 	return errors.New("entry not found")
 }
 
-// SearchByServiceIP looks up entries by ServiceIP. O(1) index lookup plus a
-// copy of the matching bucket - the previous implementation scanned every
-// entry's ServiceIP list on every call, on the packet path, per packet.
+// SearchByServiceIP looks up entries by ServiceIP. O(1) index lookup - the
+// previous implementation scanned every entry's ServiceIP list on every
+// call, on the packet path, per packet. The returned slice is the index's
+// own bucket, not a copy: rebuildIndexesLocked always replaces byServiceIP
+// wholesale rather than mutating a published bucket in place, so it's safe
+// to hand out directly. It's capped at its current length so an append by
+// the caller can't spill into (and silently reuse) the map's own capacity.
 func (t *TableManager) SearchByServiceIP(ip net.IP) []TableEntry {
 	addr, ok := AddrFromIP(ip)
 	if !ok {
-		return make([]TableEntry, 0)
+		return nil
 	}
 	t.rwlock.RLock()
 	defer t.rwlock.RUnlock()
 	matches := t.byServiceIP[addr]
-	if len(matches) == 0 {
-		return make([]TableEntry, 0)
-	}
-	result := make([]TableEntry, len(matches))
-	copy(result, matches)
-	return result
+	return matches[:len(matches):len(matches)]
 }
 
 // SearchByNsIP looks up a single entry by namespace IP. O(1) index lookup -

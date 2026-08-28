@@ -226,30 +226,7 @@ func (p Packet) rewriteV4(newSrc, newDst netip.Addr) bool {
 	writeUint16(p.buf[10:12], checksumAdjust(hc, oldAddrs[:], newAddrs[:]))
 
 	if p.l4Start >= 0 {
-		switch p.protocol {
-		case ProtoTCP:
-			if len(p.buf) >= p.l4Start+tcpHeaderMinLen {
-				off := p.l4Start + 16
-				csum := readUint16(p.buf[off : off+2])
-				writeUint16(p.buf[off:off+2], checksumAdjust(csum, oldAddrs[:], newAddrs[:]))
-			}
-		case ProtoUDP:
-			if len(p.buf) >= p.l4Start+udpHeaderLen {
-				off := p.l4Start + 6
-				csum := readUint16(p.buf[off : off+2])
-				// 0x0000 means "checksum not computed" for IPv4/UDP and must
-				// be left alone, never patched.
-				if csum != 0 {
-					newCsum := checksumAdjust(csum, oldAddrs[:], newAddrs[:])
-					if newCsum == 0 {
-						// 0 is reserved to mean "no checksum"; a genuine
-						// zero result is transmitted as all-ones instead.
-						newCsum = 0xffff
-					}
-					writeUint16(p.buf[off:off+2], newCsum)
-				}
-			}
-		}
+		patchL4Checksum(p.buf, p.l4Start, p.protocol, oldAddrs[:], newAddrs[:], true)
 	}
 
 	copy(p.buf[12:16], srcBytes[:])
@@ -272,29 +249,41 @@ func (p Packet) rewriteV6(newSrc, newDst netip.Addr) bool {
 	// IPv6 has no header checksum of its own, only the L4 checksum (which
 	// covers the pseudo-header's addresses) needs fixing up.
 	if p.l4Start >= 0 {
-		switch p.protocol {
-		case ProtoTCP:
-			if len(p.buf) >= p.l4Start+tcpHeaderMinLen {
-				off := p.l4Start + 16
-				csum := readUint16(p.buf[off : off+2])
-				writeUint16(p.buf[off:off+2], checksumAdjust(csum, oldAddrs[:], newAddrs[:]))
-			}
-		case ProtoUDP:
-			if len(p.buf) >= p.l4Start+udpHeaderLen {
-				off := p.l4Start + 6
-				csum := readUint16(p.buf[off : off+2])
-				// Unlike IPv4, the UDP checksum is mandatory over IPv6
-				// (RFC 8200 8.1) and must never be transmitted as 0.
-				newCsum := checksumAdjust(csum, oldAddrs[:], newAddrs[:])
-				if newCsum == 0 {
-					newCsum = 0xffff
-				}
-				writeUint16(p.buf[off:off+2], newCsum)
-			}
-		}
+		patchL4Checksum(p.buf, p.l4Start, p.protocol, oldAddrs[:], newAddrs[:], false)
 	}
 
 	copy(p.buf[8:24], srcBytes[:])
 	copy(p.buf[24:40], dstBytes[:])
 	return true
+}
+
+// patchL4Checksum fixes up the TCP/UDP checksum at l4Start for the
+// old->new address swap, via RFC 1624 incremental update (checksumAdjust).
+// ipv4UDP selects IPv4/UDP's special case, where a stored checksum of
+// 0x0000 means "not computed" and must be left untouched rather than
+// patched - unlike TCP and IPv6/UDP, where the checksum is mandatory and a
+// result that folds to 0 is instead transmitted as the reserved all-ones
+// value.
+func patchL4Checksum(buf []byte, l4Start int, protocol uint8, oldAddrs, newAddrs []byte, ipv4UDP bool) {
+	switch protocol {
+	case ProtoTCP:
+		if len(buf) >= l4Start+tcpHeaderMinLen {
+			off := l4Start + 16
+			csum := readUint16(buf[off : off+2])
+			writeUint16(buf[off:off+2], checksumAdjust(csum, oldAddrs, newAddrs))
+		}
+	case ProtoUDP:
+		if len(buf) >= l4Start+udpHeaderLen {
+			off := l4Start + 6
+			csum := readUint16(buf[off : off+2])
+			if ipv4UDP && csum == 0 {
+				return
+			}
+			newCsum := checksumAdjust(csum, oldAddrs, newAddrs)
+			if newCsum == 0 {
+				newCsum = 0xffff
+			}
+			writeUint16(buf[off:off+2], newCsum)
+		}
+	}
 }

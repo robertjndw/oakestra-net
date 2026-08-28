@@ -136,18 +136,19 @@ func (proxy *GoProxyTunnel) outgoingProxy(pkt *iputils.Packet) (dstHost net.IP, 
 	srcport := int(pkt.SrcPort())
 	dstport := int(pkt.DstPort())
 
+	dstIPNet := netIPFromAddr(dstIP)
 	var inProxySubnet bool
 	if pkt.Version() == 4 {
-		inProxySubnet = proxy.ProxyIpSubnetwork.Contains(netIPFromAddr(dstIP))
+		inProxySubnet = proxy.ProxyIpSubnetwork.Contains(dstIPNet)
 	} else {
-		inProxySubnet = proxy.ProxyIPv6Subnetwork.Contains(netIPFromAddr(dstIP))
+		inProxySubnet = proxy.ProxyIPv6Subnetwork.Contains(dstIPNet)
 	}
 	if !inProxySubnet {
 		return nil, 0, false
 	}
 
 	// Check if the ServiceIP is known
-	tableEntryList := proxy.environment.GetTableEntryByServiceIP(netIPFromAddr(dstIP))
+	tableEntryList := proxy.environment.GetTableEntryByServiceIP(dstIPNet)
 	if len(tableEntryList) < 1 {
 		return nil, 0, false
 	}
