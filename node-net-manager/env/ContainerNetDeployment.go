@@ -157,6 +157,11 @@ func (h *ContainerDeyplomentHandler) DeployNetwork(pid int, sname string, instan
 	logger.DebugLogger().Printf("New deployedServices table: %v", env.deployedServices)
 
 	if env.ebpfManager != nil {
+		// See disableChecksumOffload's doc comment: without this, the fast
+		// path's incremental checksum patch operates on a checksum the veth
+		// driver hadn't actually finished computing yet.
+		env.disableChecksumOffload(pid, vethIfce.PeerName)
+
 		if err := env.ebpfManager.AttachEgress(vethIfce.Attrs().Index); err != nil {
 			logger.ErrorLogger().Println("ebpf: attaching tc_egress, falling back to ProxyTUN for this container:", err)
 		} else if err := env.ebpfManager.SetLocalInstance(ip, vethIfce.Attrs().Index, peerVeth.Attrs().Index); err != nil {

@@ -364,6 +364,33 @@ func (env *Environment) disableDAD(pid int, vethname string) error {
 	return err
 }
 
+// disableChecksumOffload turns off TX checksum offload on the container's
+// veth, so packets leaving the container always carry a complete,
+// kernel-computed checksum. Without this, the eBPF fast path's incremental
+// checksum patch (bpf_l3_csum_replace/bpf_l4_csum_replace in oakestra.c)
+// patches a checksum the veth driver had deferred to compute later,
+// producing a corrupt packet - one a real NIC or router would drop, though
+// many virtual interfaces skip RX checksum validation and mask the bug.
+//
+// Best-effort and non-fatal: this only matters when the eBPF fast path is
+// attached (callers gate on that), and a missing ethtool binary or an
+// unsupported feature on some exotic device type shouldn't block container
+// deployment - it just means that container's traffic keeps the offload
+// behavior ProxyTUN was already unaffected by (it recomputes checksums
+// itself instead of patching them).
+func (env *Environment) disableChecksumOffload(pid int, vethname string) {
+	err := env.execInsideNs(pid, func() error {
+		cmd := exec.Command("ethtool", "-K", vethname, "tx-checksum-ip-generic", "off")
+		return cmd.Run()
+	})
+	if err != nil {
+		logger.ErrorLogger().Printf(
+			"Unable to disable checksum offload on %s, eBPF fast path may see incomplete checksums for this container: %v",
+			vethname, err,
+		)
+	}
+}
+
 // Execute function inside a namespace
 func (env *Environment) execInsideNs(pid int, function func() error) error {
 	var containerNs netns.NsHandle
