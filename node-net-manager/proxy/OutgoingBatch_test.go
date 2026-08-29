@@ -14,6 +14,10 @@ import (
 // fakeBatchWriter stands in for a real *ipv4.PacketConn/*ipv6.PacketConn (see
 // tunnelConn.batch), counting calls and recording every packet handed to it.
 // If err is set, every call fails and records nothing.
+//
+// A failed call returns -1, not 0, because that is what Linux does: WriteBatch
+// passes sendmmsg(2)'s return through untouched. Darwin normalises it to 0, and
+// a fake that copied Darwin is how the negative count slipped past to begin with.
 type fakeBatchWriter struct {
 	calls   int
 	written [][]byte
@@ -23,7 +27,7 @@ type fakeBatchWriter struct {
 func (f *fakeBatchWriter) WriteBatch(ms []ipv4.Message, flags int) (int, error) {
 	f.calls++
 	if f.err != nil {
-		return 0, f.err
+		return -1, f.err
 	}
 	for _, m := range ms {
 		f.written = append(f.written, append([]byte(nil), m.Buffers[0]...))
@@ -211,6 +215,24 @@ func TestOutgoingBatchOnePeerFailureDoesNotBlockOthers(t *testing.T) {
 	}
 	if len(okWriter.written) != 1 {
 		t.Errorf("the healthy destination received %d packets; want 1 - a sibling failure must not block it", len(okWriter.written))
+	}
+}
+
+// TestSendOverTunnelBatchSurvivesNegativeWriteCount checks that a failed
+// batched send doesn't take the outgoing loop down with it. Linux reports the
+// failure as -1, and peers restarting make that routine: their ICMP
+// port-unreachable comes back as ECONNREFUSED on the next send.
+func TestSendOverTunnelBatchSurvivesNegativeWriteCount(t *testing.T) {
+	tunnel := batchTestTunnel(&fakeTunnelSocket{}, &fakeTunDevice{batchSize: 4})
+	dst := netip.AddrPortFrom(mustAddr(nodeBIP), uint16(tunnelPort))
+	writer := &fakeBatchWriter{err: errors.New("sendmmsg: connection refused")}
+	tunnel.connectionBuffer[dst] = fakeConn(t, writer)
+
+	packet := buildTestPacketV4(t, clientNsIP, serverVIP, 42000, 443)
+	tunnel.sendOverTunnelBatch(dst, [][]byte{packet}, newOutgoingBatch(4), 0)
+
+	if writer.calls == 0 {
+		t.Fatal("the failing write was never attempted")
 	}
 }
 

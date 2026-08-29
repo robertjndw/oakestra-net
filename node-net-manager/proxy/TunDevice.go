@@ -16,8 +16,8 @@ import (
 // tunHeaderOffset+sizes[i]] holds the packet, on both Read and Write. See
 // tunHeaderOffset for why the headroom exists.
 type TunDevice interface {
-	// A short read is not an error - see ErrTooManySegments's handling
-	// below, which can turn an oversized read into n=0, nil.
+	// n may be less than len(bufs), or 0; only [0, n) is populated. A
+	// partially split GSO superpacket comes back as n packets and no error.
 	ReadBatch(bufs [][]byte, sizes []int) (int, error)
 	// WriteBatch may mutate bufs; the caller must not read them again
 	// afterwards assuming they're unchanged.
@@ -56,12 +56,30 @@ func newWgTunDevice(dev tun.Device) *wgTunDevice {
 }
 
 func (w *wgTunDevice) ReadBatch(bufs [][]byte, sizes []int) (int, error) {
+	// Callers reuse sizes across reads, so zero the last slot: the overflow
+	// branch below leans on it to tell a written buffer from an untouched one.
+	last := len(bufs) - 1
+	if last >= 0 {
+		sizes[last] = 0
+	}
+
 	n, err := w.dev.Read(bufs, sizes, tunHeaderOffset)
 	if err != nil && errors.Is(err, tun.ErrTooManySegments) {
-		// Non-fatal: a GSO superpacket had more segments than this batch had
-		// buffers for. The extra segments are lost but the fd is still good.
-		logger.ErrorLogger().Println("tun: dropped a GSO superpacket wider than the read batch:", err)
-		return 0, nil
+		// A GSO superpacket outgrew the batch. The fd is still good, so keep
+		// the segments that fit rather than throwing the whole read away.
+		//
+		// gsoSplit fills every buffer before giving up but returns i-1, so its
+		// count is one short of what it actually wrote. Undo that - but only
+		// for that exact shape, and only if the buffer really was written. If
+		// upstream ever fixes the arithmetic, or falls short by more than one,
+		// believe the count instead: losing a segment costs one packet,
+		// inventing one puts a stale packet on the wire.
+		if n == last && sizes[n] > 0 {
+			n++
+		}
+		logger.ErrorLogger().Printf(
+			"tun: GSO superpacket wider than the read batch; keeping %d segments, rest dropped: %v", n, err)
+		return n, nil
 	}
 	return n, err
 }

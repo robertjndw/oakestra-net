@@ -192,6 +192,10 @@ func TestHandleIngoingOnlyDeliversOrDrops(t *testing.T) {
 // fakeWgDevice is a minimal tun.Device fake for testing the real adapter's
 // handling of tun.ErrTooManySegments without opening a real TUN device
 // (which needs root).
+//
+// The overflow case copies gsoSplit exactly: fill every buffer, then report
+// one fewer. Both halves matter - (0, err) would let an adapter that throws n
+// away pass, and the honest count would hide the off-by-one it has to undo.
 type fakeWgDevice struct {
 	calls int
 }
@@ -200,10 +204,15 @@ func (d *fakeWgDevice) File() *os.File { return nil }
 
 func (d *fakeWgDevice) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	d.calls++
-	if d.calls == 1 {
-		return 0, tun.ErrTooManySegments
-	}
 	pkt := []byte{0x45, 0x00, 0x00, 0x14}
+	if d.calls == 1 {
+		// What gsoSplit does when it runs out of room: every buffer
+		// written, count one short.
+		for i := range bufs {
+			sizes[i] = copy(bufs[i][offset:], pkt)
+		}
+		return len(bufs) - 1, tun.ErrTooManySegments
+	}
 	n := copy(bufs[0][offset:], pkt)
 	sizes[0] = n
 	return 1, nil
@@ -217,20 +226,147 @@ func (d *fakeWgDevice) Close() error                                 { return ni
 func (d *fakeWgDevice) BatchSize() int                               { return 4 }
 
 // TestWgTunDeviceErrTooManySegmentsIsNotFatal checks that a GSO superpacket
-// wider than the read batch doesn't stop later reads from succeeding.
+// wider than the read batch is absorbed rather than propagated, and that
+// later reads still succeed.
 func TestWgTunDeviceErrTooManySegmentsIsNotFatal(t *testing.T) {
+	const batch = 4
 	w := newWgTunDevice(&fakeWgDevice{})
-	bufs := [][]byte{make([]byte, tunHeaderOffset+64)}
-	sizes := make([]int, 1)
+	bufs := make([][]byte, batch)
+	for i := range bufs {
+		bufs[i] = make([]byte, tunHeaderOffset+64)
+	}
+	sizes := make([]int, batch)
 
-	n, err := w.ReadBatch(bufs, sizes)
-	if err != nil || n != 0 {
-		t.Fatalf("first read: got (%d, %v); want (0, nil) - ErrTooManySegments must be absorbed, not propagated", n, err)
+	if _, err := w.ReadBatch(bufs, sizes); err != nil {
+		t.Fatalf("first read: got err %v; want nil - ErrTooManySegments must be absorbed, not propagated", err)
 	}
 
-	n, err = w.ReadBatch(bufs, sizes)
+	n, err := w.ReadBatch(bufs, sizes)
 	if err != nil || n != 1 {
 		t.Fatalf("second read: got (%d, %v); want (1, nil) - the device must still work after the error", n, err)
+	}
+}
+
+// TestWgTunDeviceErrTooManySegmentsKeepsTheSegmentsThatFit checks that every
+// segment that fit survives the error, the last one included - gsoSplit writes
+// it but leaves it out of its count. Dropping segments here costs good packets
+// on every oversized superpacket, on top of those that really didn't fit.
+func TestWgTunDeviceErrTooManySegmentsKeepsTheSegmentsThatFit(t *testing.T) {
+	const batch = 4
+	w := newWgTunDevice(&fakeWgDevice{})
+	bufs := make([][]byte, batch)
+	for i := range bufs {
+		bufs[i] = make([]byte, tunHeaderOffset+64)
+	}
+	sizes := make([]int, batch)
+
+	n, err := w.ReadBatch(bufs, sizes)
+	if err != nil {
+		t.Fatalf("ReadBatch returned err %v; want nil", err)
+	}
+	if n != batch {
+		t.Fatalf("ReadBatch kept %d segments; want %d - every populated buffer must survive the error", n, batch)
+	}
+	for i := 0; i < n; i++ {
+		if sizes[i] != 4 {
+			t.Errorf("segment %d: size %d; want 4", i, sizes[i])
+		}
+		if got := bufs[i][tunHeaderOffset]; got != 0x45 {
+			t.Errorf("segment %d: first byte 0x%02x at tunHeaderOffset; want 0x45", i, got)
+		}
+	}
+}
+
+// fakeOverflowWgDevice fails with ErrTooManySegments in whatever shape the
+// test picks: it writes filled buffers and claims report of them. The pinned
+// gsoSplit is always exactly one short of a full batch - this covers the
+// upstreams that wouldn't be.
+type fakeOverflowWgDevice struct {
+	filled int
+	report int
+}
+
+func (d *fakeOverflowWgDevice) File() *os.File { return nil }
+
+func (d *fakeOverflowWgDevice) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+	pkt := []byte{0x45, 0x00, 0x00, 0x14}
+	for i := 0; i < d.filled; i++ {
+		sizes[i] = copy(bufs[i][offset:], pkt)
+	}
+	return d.report, tun.ErrTooManySegments
+}
+
+func (d *fakeOverflowWgDevice) Write(bufs [][]byte, offset int) (int, error) { return len(bufs), nil }
+func (d *fakeOverflowWgDevice) MTU() (int, error)                            { return 1500, nil }
+func (d *fakeOverflowWgDevice) Name() (string, error)                        { return "faketun", nil }
+func (d *fakeOverflowWgDevice) Events() <-chan tun.Event                     { return nil }
+func (d *fakeOverflowWgDevice) Close() error                                 { return nil }
+func (d *fakeOverflowWgDevice) BatchSize() int                               { return 4 }
+
+// TestWgTunDeviceErrTooManySegmentsNeverInventsASegment checks that the +1
+// only fires on the pinned split's off-by-one. Every other shape is taken at
+// face value: handing back a buffer nobody wrote trades a lost packet for a
+// stale one, which is the worse bug.
+func TestWgTunDeviceErrTooManySegmentsNeverInventsASegment(t *testing.T) {
+	const batch = 4
+	tests := []struct {
+		name           string
+		filled, report int
+		want           int
+	}{
+		{"upstream corrects the off-by-one", batch, batch, batch},
+		{"upstream short by more than one", 2, 1, 1},
+		{"upstream over-reports", 2, 3, 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWgTunDevice(&fakeOverflowWgDevice{filled: tc.filled, report: tc.report})
+			bufs := make([][]byte, batch)
+			for i := range bufs {
+				bufs[i] = make([]byte, tunHeaderOffset+64)
+			}
+
+			n, err := w.ReadBatch(bufs, make([]int, batch))
+			if err != nil {
+				t.Fatalf("ReadBatch returned err %v; want nil", err)
+			}
+			if n != tc.want {
+				t.Fatalf("ReadBatch returned %d segments; want %d", n, tc.want)
+			}
+		})
+	}
+}
+
+// TestWgTunDeviceErrTooManySegmentsIgnoresStaleSizes checks that the +1 reads
+// a size this read wrote, not one left over from the last. ingoingBatch reuses
+// its sizes slice across reads, so without the clear an untouched buffer
+// inherits a plausible length and passes for a packet.
+func TestWgTunDeviceErrTooManySegmentsIgnoresStaleSizes(t *testing.T) {
+	const batch = 4
+	bufs := make([][]byte, batch)
+	for i := range bufs {
+		bufs[i] = make([]byte, tunHeaderOffset+64)
+	}
+	sizes := make([]int, batch)
+
+	// Prime the slice so the last slot holds a stale, non-zero size.
+	w := newWgTunDevice(&fakeWgDevice{})
+	if n, err := w.ReadBatch(bufs, sizes); err != nil || n != batch {
+		t.Fatalf("priming read: got (%d, %v); want (%d, nil)", n, err, batch)
+	}
+	if sizes[batch-1] == 0 {
+		t.Fatal("priming read left the last size at 0 - it can no longer go stale")
+	}
+
+	// This one stops short without writing the last buffer, yet reports the
+	// same count as the off-by-one case - only the size entry tells them apart.
+	w = newWgTunDevice(&fakeOverflowWgDevice{filled: batch - 1, report: batch - 1})
+	n, err := w.ReadBatch(bufs, sizes)
+	if err != nil {
+		t.Fatalf("ReadBatch returned err %v; want nil", err)
+	}
+	if n != batch-1 {
+		t.Fatalf("ReadBatch returned %d segments; want %d - the untouched buffer must not be reclaimed on a stale size", n, batch-1)
 	}
 }
 

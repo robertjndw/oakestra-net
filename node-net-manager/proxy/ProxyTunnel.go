@@ -464,7 +464,14 @@ func (t *Tunnel) sendOverTunnelBatch(dst netip.AddrPort, bufs [][]byte, scratch 
 
 	for len(bufs) > 0 {
 		sent, err := con.batch.WriteBatch(scratch.writeMessages(bufs), 0)
-		bufs = bufs[sent:]
+		// sendmmsg(2) returns -1 on failure and WriteBatch hands that straight
+		// back, so slicing by it panics. Nothing went out, so the retry below
+		// resends the whole group. Not an exotic path either - a restarted
+		// peer replies ICMP port-unreachable, which lands here as
+		// ECONNREFUSED on the next send.
+		if sent > 0 {
+			bufs = bufs[sent:]
+		}
 		if err == nil {
 			if sent == 0 {
 				// A silent no-op is only documented to happen on error -
