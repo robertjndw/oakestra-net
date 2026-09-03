@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"NetManager/clock"
 	"NetManager/logger"
 	"net"
 	"net/netip"
@@ -460,7 +461,7 @@ func (t *Tunnel) sendOverTunnelBatch(dst netip.AddrPort, bufs [][]byte, scratch 
 	if err != nil {
 		return
 	}
-	con.lastUsed.Store(coarseClock.Load())
+	con.lastUsed.Store(clock.Unix())
 
 	for len(bufs) > 0 {
 		sent, err := con.batch.WriteBatch(scratch.writeMessages(bufs), 0)
@@ -527,7 +528,7 @@ func newTunnelConn(conn *net.UDPConn, dst netip.AddrPort) *tunnelConn {
 		bw = ipv6.NewPacketConn(conn)
 	}
 	tc := &tunnelConn{conn: conn, batch: bw}
-	tc.lastUsed.Store(coarseClock.Load())
+	tc.lastUsed.Store(clock.Unix())
 	return tc
 }
 
@@ -543,7 +544,7 @@ func (t *Tunnel) startConnectionEviction() {
 }
 
 func (t *Tunnel) evictIdleConnections(timeout time.Duration) {
-	cutoff := coarseClock.Load() - int64(timeout.Seconds())
+	cutoff := clock.Unix() - int64(timeout.Seconds())
 
 	// Collect first, then close outside the lock: Close can block, and the
 	// datapath needs this map back.

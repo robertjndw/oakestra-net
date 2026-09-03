@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"NetManager/clock"
 	"NetManager/proxy/iputils"
 	"net/netip"
 	"sync"
@@ -57,7 +58,7 @@ func keyFor(pkt *iputils.Packet) fragmentKey {
 }
 
 func (fc *fragmentCache) remember(key fragmentKey, tr fragmentTranslation) {
-	tr.expires = coarseClock.Load() + fragmentTTLSeconds
+	tr.expires = clock.Unix() + fragmentTTLSeconds
 
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
@@ -79,7 +80,7 @@ func (fc *fragmentCache) lookup(key fragmentKey) (fragmentTranslation, bool) {
 	if !ok {
 		return fragmentTranslation{}, false
 	}
-	if coarseClock.Load() > tr.expires {
+	if clock.Unix() > tr.expires {
 		delete(fc.entries, key)
 		return fragmentTranslation{}, false
 	}
@@ -93,7 +94,7 @@ func (fc *fragmentCache) evictExpired() {
 }
 
 func (fc *fragmentCache) evictExpiredLocked() {
-	now := coarseClock.Load()
+	now := clock.Unix()
 	for key, tr := range fc.entries {
 		if now > tr.expires {
 			delete(fc.entries, key)

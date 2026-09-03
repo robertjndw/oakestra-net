@@ -81,6 +81,7 @@ Port `50103` is reserved and cannot be used by deployed services.
 - **`server/`** — HTTP REST API accepting requests from NodeEngine (Unix socket at `/etc/netmanager/netmanager.sock`)
 - **`TableEntryCache/`** — in-memory cache for the service translation table. `TableManager` keeps three indexes rebuilt wholesale on every mutation: `byServiceIP`, `byNsIP`, and `byNsIPInstance`, the narrow one the packet path uses (namespace IP → instance addresses only)
 - **`events/`** — internal pub/sub for table-query events (used to reset MQTT interest timeouts)
+- **`clock/`** — a 1Hz coarse Unix-seconds clock, written by one ticker goroutine and read atomically by everyone else. Anything on the packet path that needs a "last used" timestamp reads this instead of calling `time.Now()`, which costs ~29ns per call and swamps the lookup it is timestamping
 - **`cmd/`** — Cobra CLI (`root.go` startup, `logs.go`, `status.go`, `version.go`); version injected at build time via `-ldflags`
 - **`model/`** — `NetConfiguration` struct mirrors `/etc/netmanager/netcfg.json`
 

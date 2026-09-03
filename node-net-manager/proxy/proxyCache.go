@@ -2,11 +2,11 @@ package proxy
 
 import (
 	"NetManager/TableEntryCache"
+	"NetManager/clock"
 	"NetManager/logger"
 	"NetManager/resolver"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -65,22 +65,6 @@ type ProxyCache struct {
 	frags *fragmentCache
 }
 
-// coarseClock is a 1Hz-updated Unix-seconds clock shared by every
-// ProxyCache entry. Recording "last used" on every cache hit doesn't need
-// second-level precision, so entries read this instead of each calling
-// time.Now() (a vDSO call) on every packet.
-var coarseClock atomic.Int64
-
-func init() {
-	coarseClock.Store(time.Now().Unix())
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		for range ticker.C {
-			coarseClock.Store(time.Now().Unix())
-		}
-	}()
-}
-
 func NewProxyCache() *ProxyCache {
 	cache := &ProxyCache{
 		cache: make([]conversionBucket, 65536),
@@ -107,7 +91,7 @@ func (cache *ProxyCache) runEvictionJob(interval time.Duration, timeout time.Dur
 // the timeout. It walks one shard at a time so it never holds a lock covering
 // the whole table.
 func (cache *ProxyCache) evictOldEntries(timeout time.Duration) {
-	now := coarseClock.Load()
+	now := clock.Unix()
 	timeoutSeconds := int64(timeout.Seconds())
 	evictedCount := 0
 
@@ -193,7 +177,7 @@ func (cache *ProxyCache) Route(key FlowKey, lookup resolver.ServiceLookup) (Rout
 			}
 			entry.routeGen = lookup.Generation
 		}
-		entry.lastUsed = coarseClock.Load()
+		entry.lastUsed = clock.Unix()
 		return Route{
 			SrcInstanceIP: entry.srcInstanceIp,
 			DstIP:         entry.dstip,
@@ -244,7 +228,7 @@ func (cache *ProxyCache) Reverse(protocol uint8, localNsIP netip.Addr, localPort
 		if entry.dstInstanceIp.IsValid() && entry.dstInstanceIp != remoteIP {
 			continue
 		}
-		entry.lastUsed = coarseClock.Load()
+		entry.lastUsed = clock.Unix()
 		return ReverseRoute{DstServiceIP: entry.dstServiceIp, SrcIP: entry.srcip}, true
 	}
 	return ReverseRoute{}, false
@@ -263,7 +247,7 @@ func (e *ConversionEntry) sameFlowAs(other *ConversionEntry) bool {
 
 // Add inserts a flow, replacing the entry for the same flow if there is one.
 func (cache *ProxyCache) Add(entry ConversionEntry) {
-	entry.lastUsed = coarseClock.Load()
+	entry.lastUsed = clock.Unix()
 
 	shard := shardOf(entry.srcport)
 	cache.locks[shard].Lock()

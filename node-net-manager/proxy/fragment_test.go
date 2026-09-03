@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"NetManager/clock"
 	"NetManager/proxy/iputils"
 	"bytes"
 	"encoding/binary"
@@ -232,7 +233,7 @@ func TestFragmentStateExpires(t *testing.T) {
 	// Age the entry out without waiting on the wall clock.
 	cache.mu.Lock()
 	entry := cache.entries[key]
-	entry.expires = coarseClock.Load() - 1
+	entry.expires = clock.Unix() - 1
 	cache.entries[key] = entry
 	cache.mu.Unlock()
 

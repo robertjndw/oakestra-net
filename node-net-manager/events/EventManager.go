@@ -4,6 +4,7 @@
 package events
 
 import (
+	"NetManager/clock"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,9 +15,12 @@ type Activity struct {
 	stamp atomic.Int64 // Unix seconds, 0 = never touched
 }
 
-// Touch records that target was just used.
+// Touch records that target was just used. It runs on the packet path, so it
+// reads the shared coarse clock rather than calling time.Now() itself; the
+// interest timeouts this feeds are minutes long, so a second of slack is
+// irrelevant to them.
 func (a *Activity) Touch() {
-	a.stamp.Store(time.Now().Unix())
+	a.stamp.Store(clock.Unix())
 }
 
 // IdleFor reports how long since the last Touch, or forever if never touched.
