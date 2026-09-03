@@ -201,16 +201,12 @@ func (t *Tunnel) tunIngoingListen() {
 // per group rather than once per packet.
 type outgoingBatchGroup struct {
 	dst  netip.AddrPort
-	gen  uint64
 	bufs [][]byte
 }
 
 // outgoingBatch holds the fixed set of buffers the outgoing loop reuses
 // across every read (see batchPacketCap), plus the state that groups one
-// read's ActionForward packets by destination. groupOf and groups only grow,
-// never get cleared or reallocated, as new destinations are seen; gen
-// distinguishes "touched this batch" from "leftover from an older one"
-// without walking either structure between reads (see group).
+// read's ActionForward packets by destination.
 type outgoingBatch struct {
 	envelopes [][]byte
 	bufs      [][]byte
@@ -218,10 +214,15 @@ type outgoingBatch struct {
 
 	deliverable [][]byte // ActionDeliver packets, collected for one tun.WriteBatch
 
-	groupOf map[netip.AddrPort]int // dst -> index into groups
-	groups  []outgoingBatchGroup
-	active  []int // indices into groups touched this batch, in first-seen order
-	gen     uint64
+	// groups[:liveGroups] are the destinations seen in the batch just read,
+	// in first-seen order. Found by linear scan rather than a map keyed on
+	// the destination: one TUN read's packets are bound for a handful of
+	// peer nodes at most, and comparing that many netip.AddrPorts costs less
+	// than hashing one. Retired slots past liveGroups are kept, not
+	// discarded, so their bufs capacity is reused by the next batch instead
+	// of reallocated.
+	groups     []outgoingBatchGroup
+	liveGroups int
 
 	msgs []ipv4.Message // scratch for sendOverTunnelBatch - see writeMessages
 }
@@ -235,7 +236,6 @@ func newOutgoingBatch(size int) *outgoingBatch {
 		bufs:        make([][]byte, size),
 		sizes:       make([]int, size),
 		deliverable: make([][]byte, 0, size),
-		groupOf:     make(map[netip.AddrPort]int),
 	}
 	for i := range b.envelopes {
 		b.envelopes[i] = make([]byte, tunHeaderOffset+batchPacketCap)
@@ -246,25 +246,24 @@ func newOutgoingBatch(size int) *outgoingBatch {
 	return b
 }
 
-// group appends packet to the batch's group for dst, creating or recycling a
+// group appends packet to the batch's group for dst, opening or recycling a
 // group slot as needed. packet aliases one of b.envelopes' buffers, so it's
-// only valid until the next ReadBatch - callers must drain active before then.
+// only valid until the next ReadBatch - callers must drain the groups before
+// then.
 func (b *outgoingBatch) group(dst netip.AddrPort, packet []byte) {
-	idx, exists := b.groupOf[dst]
-	if exists && b.groups[idx].gen == b.gen {
-		b.groups[idx].bufs = append(b.groups[idx].bufs, packet)
-		return
+	for i := 0; i < b.liveGroups; i++ {
+		if b.groups[i].dst == dst {
+			b.groups[i].bufs = append(b.groups[i].bufs, packet)
+			return
+		}
 	}
-	if !exists {
-		idx = len(b.groups)
+	if b.liveGroups == len(b.groups) {
 		b.groups = append(b.groups, outgoingBatchGroup{})
-		b.groupOf[dst] = idx
 	}
-	g := &b.groups[idx]
+	g := &b.groups[b.liveGroups]
 	g.dst = dst
-	g.gen = b.gen
 	g.bufs = append(g.bufs[:0], packet)
-	b.active = append(b.active, idx)
+	b.liveGroups++
 }
 
 // writeMessages resizes b.msgs to len(bufs) and points each message's single
@@ -297,8 +296,7 @@ func (t *Tunnel) runOutgoingBatch(b *outgoingBatch) error {
 	}
 
 	b.deliverable = b.deliverable[:0]
-	b.active = b.active[:0]
-	b.gen++
+	b.liveGroups = 0
 
 	for i := 0; i < n; i++ {
 		packet := b.envelopes[i][tunHeaderOffset : tunHeaderOffset+b.sizes[i]]
@@ -323,8 +321,8 @@ func (t *Tunnel) runOutgoingBatch(b *outgoingBatch) error {
 
 	// Drained after the delivery write: sendOverTunnelBatch can block briefly
 	// on redial, and there's no reason to hold the TUN write on that.
-	for _, idx := range b.active {
-		g := &b.groups[idx]
+	for i := 0; i < b.liveGroups; i++ {
+		g := &b.groups[i]
 		t.sendOverTunnelBatch(g.dst, g.bufs, b, 0)
 	}
 	return nil

@@ -158,7 +158,7 @@ func TestGenerationTracksRouteChanges(t *testing.T) {
 	entries, _ := table.SearchByServiceIP(netip.MustParseAddr("10.30.0.1"))
 
 	nsip := netip.MustParseAddr(jobNsIP(0))
-	if !IsRouteStillValid(nsip, netip.MustParseAddr("10.0.0.1"), 50103, entries) {
+	if MatchRoute(nsip, netip.MustParseAddr("10.0.0.1"), 50103, entries) == nil {
 		t.Fatal("the route should be valid before anything changes")
 	}
 
@@ -181,7 +181,7 @@ func TestGenerationTracksRouteChanges(t *testing.T) {
 			if generationAfter == before {
 				t.Error("the generation did not move, so cached routes would never be rechecked")
 			}
-			if IsRouteStillValid(nsip, netip.MustParseAddr("10.0.0.1"), 50103, after) {
+			if MatchRoute(nsip, netip.MustParseAddr("10.0.0.1"), 50103, after) != nil {
 				t.Error("the old route is still considered valid")
 			}
 		})
@@ -283,7 +283,7 @@ func BenchmarkRemoveByJobName(b *testing.B) {
 }
 
 // only reached on a generation mismatch; steady state skips this scan entirely
-func BenchmarkIsRouteStillValid(b *testing.B) {
+func BenchmarkMatchRoute(b *testing.B) {
 	for _, replicas := range []int{1, 10, 100, 1000} {
 		b.Run(fmt.Sprintf("replicas=%d", replicas), func(b *testing.B) {
 			table := NewTableManager()
@@ -298,7 +298,7 @@ func BenchmarkIsRouteStillValid(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				IsRouteStillValid(nsip, node, 50103, entries)
+				MatchRoute(nsip, node, 50103, entries)
 			}
 		})
 	}

@@ -5,6 +5,7 @@ import (
 	"NetManager/resolver"
 	"fmt"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -191,13 +192,13 @@ func BenchmarkOutgoingProxyRegeneration(b *testing.B) {
 
 			lookup := dp.environment.GetTableEntryByServiceIP(mustAddr(serverVIP))
 			key := FlowKey{
-				Protocol:      iputils.ProtoTCP,
-				SrcIP:         mustAddr(clientNsIP),
-				SrcInstanceIP: mustAddr(clientInstIP),
-				DstServiceIP:  mustAddr(serverVIP),
-				SrcPort:       666,
-				DstPort:       80,
+				Protocol:     iputils.ProtoTCP,
+				SrcIP:        mustAddr(clientNsIP),
+				DstServiceIP: mustAddr(serverVIP),
+				SrcPort:      666,
+				DstPort:      80,
 			}
+			instanceIP := mustAddr(clientInstIP)
 
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -205,7 +206,7 @@ func BenchmarkOutgoingProxyRegeneration(b *testing.B) {
 				// A fresh, never-tagged generation each iteration forces the
 				// revalidation scan every time, not just on the first call.
 				stale := resolver.ServiceLookup{Entries: lookup.Entries, Generation: lookup.Generation + 1 + uint64(i)}
-				if _, ok := dp.proxycache.Route(key, stale); !ok {
+				if _, ok := dp.proxycache.Revalidate(key, instanceIP, 4, stale); !ok {
 					b.Fatal("expected the route to revalidate")
 				}
 			}
@@ -265,4 +266,40 @@ func BenchmarkOutgoingBatchGrouping(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkFlowCacheTwoLoops models the shape the daemon actually runs: one
+// outgoing loop and one ingoing loop, contending on the shard that carries a
+// flow and its own replies. BenchmarkFlowCacheParallel scales to GOMAXPROCS
+// instead, which overstates lock contention the daemon can never reach.
+func BenchmarkFlowCacheTwoLoops(b *testing.B) {
+	dp := getFakeDatapath()
+	outgoing := buildTestPacketV4(b, clientNsIP, serverVIP, 40000, 443)
+	dp.Handle(Outgoing, append([]byte(nil), outgoing...))
+	incoming := buildTestPacketV4(b, serverInstIP, clientNsIP, 443, 40000)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, len(outgoing))
+		for i := 0; i < b.N; i++ {
+			copy(buf, outgoing)
+			pkt, _ := iputils.Parse(buf)
+			dp.outgoingProxy(&pkt)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, len(incoming))
+		for i := 0; i < b.N; i++ {
+			copy(buf, incoming)
+			pkt, _ := iputils.Parse(buf)
+			dp.ingoingProxy(&pkt)
+		}
+	}()
+	wg.Wait()
 }

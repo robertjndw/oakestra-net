@@ -29,14 +29,17 @@ const (
 // Every method reads or mutates buf directly; Packet itself never allocates
 // and never copies buf. The zero value is not valid - always obtain a
 // Packet via Parse.
+// Fields are ordered widest-first and l4Start is an int32 rather than an int
+// so the whole thing packs into 40 bytes: Parse returns one of these by value
+// for every packet, and the padding a natural field order leaves behind is
+// pure copy cost on that path.
 type Packet struct {
 	buf      []byte
+	fragID   uint32
+	l4Start  int32 // offset of the L4 (TCP/UDP) header; -1 if none is present here
 	version  uint8 // 4 or 6
 	protocol uint8 // IPv4 protocol field / IPv6 next-header of the L4 payload
-	ipLen    int   // IP header length in bytes (v4: IHL*4; v6: 40 + extension headers)
-	l4Start  int   // offset of the L4 (TCP/UDP) header; -1 if none is present here
 	fragment bool  // this datagram was fragmented (v4: MF or non-zero offset; v6: a fragment header)
-	fragID   uint32
 }
 
 // Parse decodes buf just far enough to translate it: IP version, header
@@ -71,7 +74,6 @@ func parseIPv4(buf []byte) (Packet, bool) {
 		buf:      buf,
 		version:  4,
 		protocol: buf[9],
-		ipLen:    ihl,
 		l4Start:  -1,
 	}
 	// Fragment Offset is the low 13 bits of the flags+offset field, and MF
@@ -85,7 +87,7 @@ func parseIPv4(buf []byte) (Packet, bool) {
 		p.fragID = uint32(readUint16(buf[4:6]))
 	}
 	if fragOffset == 0 {
-		p.l4Start = ihl
+		p.l4Start = int32(ihl)
 	}
 	return p, true
 }
@@ -143,13 +145,12 @@ walk:
 		buf:      buf,
 		version:  6,
 		protocol: nextHeader,
-		ipLen:    offset,
 		l4Start:  -1,
 		fragment: isFragment,
 		fragID:   fragID,
 	}
 	if !isFragment || firstFragment {
-		p.l4Start = offset
+		p.l4Start = int32(offset)
 	}
 	return p, true
 }
@@ -170,9 +171,9 @@ func (p Packet) HasTransport() bool {
 	}
 	switch p.protocol {
 	case ProtoTCP:
-		return len(p.buf) >= p.l4Start+tcpHeaderMinLen
+		return len(p.buf) >= int(p.l4Start)+tcpHeaderMinLen
 	case ProtoUDP:
-		return len(p.buf) >= p.l4Start+udpHeaderLen
+		return len(p.buf) >= int(p.l4Start)+udpHeaderLen
 	default:
 		return false
 	}
@@ -209,12 +210,12 @@ func (p Packet) DstIP() netip.Addr {
 
 // SrcPort returns the L4 source port. Only valid when HasTransport is true.
 func (p Packet) SrcPort() uint16 {
-	return readUint16(p.buf[p.l4Start : p.l4Start+2])
+	return readUint16(p.buf[int(p.l4Start) : int(p.l4Start)+2])
 }
 
 // DstPort returns the L4 destination port. Only valid when HasTransport is true.
 func (p Packet) DstPort() uint16 {
-	return readUint16(p.buf[p.l4Start+2 : p.l4Start+4])
+	return readUint16(p.buf[int(p.l4Start)+2 : int(p.l4Start)+4])
 }
 
 // Bytes returns the (possibly Rewrite-mutated) backing buffer.
@@ -247,7 +248,7 @@ func (p Packet) rewriteV4(newSrc, newDst netip.Addr) bool {
 	writeUint16(p.buf[10:12], checksumAdjust(readUint16(p.buf[10:12]), delta))
 
 	if p.l4Start >= 0 {
-		patchL4Checksum(p.buf, p.l4Start, p.protocol, delta, true)
+		patchL4Checksum(p.buf, int(p.l4Start), p.protocol, delta, true)
 	}
 
 	copy(p.buf[12:16], srcBytes[:])
@@ -266,7 +267,7 @@ func (p Packet) rewriteV6(newSrc, newDst netip.Addr) bool {
 	// IPv6 has no header checksum of its own, only the L4 checksum (which
 	// covers the pseudo-header's addresses) needs fixing up.
 	if p.l4Start >= 0 {
-		patchL4Checksum(p.buf, p.l4Start, p.protocol, delta, false)
+		patchL4Checksum(p.buf, int(p.l4Start), p.protocol, delta, false)
 	}
 
 	copy(p.buf[8:24], srcBytes[:])

@@ -3,6 +3,7 @@ package proxy
 import (
 	"NetManager/TableEntryCache"
 	"NetManager/clock"
+	"NetManager/events"
 	"NetManager/logger"
 	"NetManager/resolver"
 	"net/netip"
@@ -32,11 +33,28 @@ type ConversionEntry struct {
 	// packet path doesn't need a second table lookup by namespace IP.
 	dstNode     netip.Addr
 	dstNodePort int
+	// activity is the destination job's shared last-used stamp, held here so
+	// a warm flow can keep the job's MQTT interest alive without looking its
+	// table entry up again. Nil for a flow installed from an entry that never
+	// went through TableManager.Add.
+	activity *events.Activity
 	// routeGen is the translation table generation this route was chosen
 	// from. While it still matches, the route is known to be current and the
 	// per-replica revalidation scan can be skipped entirely.
 	routeGen uint64
 	lastUsed int64
+}
+
+// touch records that the entry was just used, for the eviction sweep. The
+// write is skipped when the stamp already reads the current second: the
+// coarse clock only moves at 1Hz, so all but the first packet of each second
+// would be storing the value that is already there, dirtying the entry's
+// cache line for nothing. Both packet loops run this on entries in the same
+// shard, so the line they leave clean is one the other core can keep shared.
+func (e *ConversionEntry) touch() {
+	if now := clock.Unix(); e.lastUsed != now {
+		e.lastUsed = now
+	}
 }
 
 // conversionBucket holds every flow whose *local* port is this bucket's index.
@@ -139,69 +157,136 @@ type ReverseRoute struct {
 // FlowKey identifies one flow: the full 5-tuple, as seen leaving the local
 // namespace. See ConversionEntry for why the full tuple, not just a port, is
 // what identifies a flow.
+//
+// The source instance IP is deliberately not part of this: it is a function
+// of SrcIP under a given translation table generation, so including it would
+// force the datapath to resolve it before it could even ask whether the flow
+// is cached. A generation bump that changes it is caught by Revalidate
+// instead, which refreshes the flow rather than rerouting it.
 type FlowKey struct {
-	Protocol                           uint8
-	SrcIP, SrcInstanceIP, DstServiceIP netip.Addr
-	SrcPort, DstPort                   int
+	Protocol            uint8
+	SrcIP, DstServiceIP netip.Addr
+	SrcPort, DstPort    int
 }
 
-// Route resolves the cached route for key. If the flow was chosen under a
-// generation older than lookup.Generation, it is revalidated against
-// lookup.Entries inside the same held lock and its generation refreshed - so
-// later packets on the same flow can skip the scan while the table stays
-// unchanged. One lock, one scan.
-func (cache *ProxyCache) Route(key FlowKey, lookup resolver.ServiceLookup) (Route, bool) {
+// matchesFlow reports whether e is the flow that key identifies.
+func (e *ConversionEntry) matchesFlow(key *FlowKey) bool {
+	return e.protocol == key.Protocol &&
+		e.dstport == key.DstPort &&
+		e.dstServiceIp == key.DstServiceIP &&
+		e.srcip == key.SrcIP
+}
+
+// Lookup resolves the cached route for key, but only when that route was
+// chosen under gen - meaning the translation table has not been rebuilt
+// since, so the route is known current. This is the steady-state packet path,
+// and the point of the generation check is that a hit here needs no table
+// access at all: not the Service IP index, not the namespace IP index, just
+// this one bucket. A miss, or a hit under an older generation, sends the
+// caller to Revalidate.
+//
+// key and route are pointers rather than values because both are large
+// enough (four netip.Addr between them) that copying them in and out costs
+// more than the bucket scan they bracket.
+func (cache *ProxyCache) Lookup(key *FlowKey, gen uint64, route *Route) bool {
+	shard := shardOf(key.SrcPort)
+	cache.locks[shard].Lock()
+
+	for i := range cache.cache[key.SrcPort].entries {
+		entry := &cache.cache[key.SrcPort].entries[i]
+		if !entry.matchesFlow(key) {
+			continue
+		}
+		if entry.routeGen != gen || entry.dstport < 1 {
+			// The flow is known but its route was picked under a table this
+			// one has moved past; Revalidate has to check it before reuse.
+			break
+		}
+		entry.use(route)
+		cache.locks[shard].Unlock()
+		return true
+	}
+
+	cache.locks[shard].Unlock()
+	return false
+}
+
+// use marks the entry as just used - both for eviction and for the
+// destination job's MQTT interest - and writes its route to out. Caller must
+// hold the entry's shard lock.
+func (e *ConversionEntry) use(out *Route) {
+	e.touch()
+	if e.activity != nil {
+		e.activity.Touch()
+	}
+	out.SrcInstanceIP = e.srcInstanceIp
+	out.DstIP = e.dstip
+	out.DstNode = e.dstNode
+	out.DstNodePort = e.dstNodePort
+}
+
+// Revalidate checks a known flow's route against the current table and, if
+// the instance it is pinned to is still there, retags it with the current
+// generation so later packets take Lookup's fast path again. It deliberately
+// refreshes rather than re-routes: an established connection has to keep the
+// replica it was pinned to for as long as that replica exists. srcInstanceIP
+// is re-resolved by the caller and refreshed here, since a table rebuild can
+// have moved it; version selects the address family the refreshed reply
+// source is read in.
+//
+// ok is false when there is no cached flow, or its instance is gone - either
+// way the caller has to choose a new route and Install it.
+func (cache *ProxyCache) Revalidate(key FlowKey, srcInstanceIP netip.Addr, version uint8, lookup resolver.ServiceLookup) (Route, bool) {
 	shard := shardOf(key.SrcPort)
 	cache.locks[shard].Lock()
 	defer cache.locks[shard].Unlock()
 
-	bucket := &cache.cache[key.SrcPort]
-	for i := range bucket.entries {
-		entry := &bucket.entries[i]
-		if entry.protocol != key.Protocol ||
-			entry.dstport != key.DstPort ||
-			entry.dstServiceIp != key.DstServiceIP ||
-			entry.srcip != key.SrcIP ||
-			entry.srcInstanceIp != key.SrcInstanceIP {
+	for i := range cache.cache[key.SrcPort].entries {
+		entry := &cache.cache[key.SrcPort].entries[i]
+		if !entry.matchesFlow(&key) {
 			continue
 		}
 		if entry.dstport < 1 {
 			return Route{}, false
 		}
-		if entry.routeGen != lookup.Generation {
-			// The table changed since this route was picked, so it has to be
-			// checked against the current replica set once. While the
-			// generation matches, that scan is skipped entirely.
-			if !TableEntryCache.IsRouteStillValid(entry.dstip, entry.dstNode, entry.dstNodePort, lookup.Entries) {
-				return Route{}, false
-			}
-			entry.routeGen = lookup.Generation
+		src := TableEntryCache.MatchRoute(entry.dstip, entry.dstNode, entry.dstNodePort, lookup.Entries)
+		if src == nil {
+			return Route{}, false
 		}
-		entry.lastUsed = clock.Unix()
-		return Route{
-			SrcInstanceIP: entry.srcInstanceIp,
-			DstIP:         entry.dstip,
-			DstNode:       entry.dstNode,
-			DstNodePort:   entry.dstNodePort,
-		}, true
+		entry.routeGen = lookup.Generation
+		entry.srcInstanceIp = srcInstanceIP
+		// Refreshed from the entry the route survived against, not carried
+		// over: a job removed and re-added between the two generations gets a
+		// fresh activity stamp, and touching the retired one would let the
+		// job's MQTT interest self-destruct under a flow that is still live.
+		entry.dstInstanceIp = TableEntryCache.InstanceAddrsOf(src).For(version)
+		entry.activity = src.Activity()
+
+		var route Route
+		entry.use(&route)
+		return route, true
 	}
 	return Route{}, false
 }
 
-// Install records a freshly chosen route for key, tagged with the
-// translation table generation it was chosen from.
-func (cache *ProxyCache) Install(key FlowKey, r Route, dstInstanceIP netip.Addr, gen uint64) {
+// Install records a freshly chosen route for key, tagged with the translation
+// table generation it was chosen from. src is the entry the route was chosen
+// from: both the address replies will arrive from and the destination job's
+// activity stamp are read off it here, so the packet path never has to go
+// back to the table for them.
+func (cache *ProxyCache) Install(key FlowKey, r Route, src *TableEntryCache.TableEntry, version uint8, gen uint64) {
 	cache.Add(ConversionEntry{
 		srcip:         key.SrcIP,
 		dstip:         r.DstIP,
 		dstServiceIp:  key.DstServiceIP,
-		srcInstanceIp: key.SrcInstanceIP,
-		dstInstanceIp: dstInstanceIP,
+		srcInstanceIp: r.SrcInstanceIP,
+		dstInstanceIp: TableEntryCache.InstanceAddrsOf(src).For(version),
 		srcport:       key.SrcPort,
 		dstport:       key.DstPort,
 		protocol:      key.Protocol,
 		dstNode:       r.DstNode,
 		dstNodePort:   r.DstNodePort,
+		activity:      src.Activity(),
 		routeGen:      gen,
 	})
 }
@@ -228,7 +313,7 @@ func (cache *ProxyCache) Reverse(protocol uint8, localNsIP netip.Addr, localPort
 		if entry.dstInstanceIp.IsValid() && entry.dstInstanceIp != remoteIP {
 			continue
 		}
-		entry.lastUsed = clock.Unix()
+		entry.touch()
 		return ReverseRoute{DstServiceIP: entry.dstServiceIp, SrcIP: entry.srcip}, true
 	}
 	return ReverseRoute{}, false
@@ -241,7 +326,6 @@ func (e *ConversionEntry) sameFlowAs(other *ConversionEntry) bool {
 		e.srcport == other.srcport &&
 		e.dstport == other.dstport &&
 		e.srcip == other.srcip &&
-		e.srcInstanceIp == other.srcInstanceIp &&
 		e.dstServiceIp == other.dstServiceIp
 }
 

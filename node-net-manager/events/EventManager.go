@@ -19,8 +19,17 @@ type Activity struct {
 // reads the shared coarse clock rather than calling time.Now() itself; the
 // interest timeouts this feeds are minutes long, so a second of slack is
 // irrelevant to them.
+//
+// The store is skipped when the stamp already reads the current second, which
+// is the case for all but the first packet of each second. One Activity is
+// shared by every flow of a job, across both packet loops, so an
+// unconditional store would bounce its cache line between cores on every
+// single packet - a load that usually hits shared state costs far less.
 func (a *Activity) Touch() {
-	a.stamp.Store(clock.Unix())
+	now := clock.Unix()
+	if a.stamp.Load() != now {
+		a.stamp.Store(now)
+	}
 }
 
 // IdleFor reports how long since the last Touch, or forever if never touched.

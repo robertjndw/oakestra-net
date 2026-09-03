@@ -90,9 +90,12 @@ func tableEntry(job, nodeip, nsip, nsipv6, vip, vipv6, instip, instipv6 string) 
 }
 
 // FakeEnv answers table lookups from a real TableManager, so tests exercise
-// the same index and validation code the daemon does.
+// the same index and validation code the daemon does. tableLookups counts the
+// Service IP lookups made against it, so tests can assert that a warm flow
+// never reaches the table at all.
 type FakeEnv struct {
-	table TableEntryCache.TableManager
+	table        TableEntryCache.TableManager
+	tableLookups int
 }
 
 func newFakeEnv(entries ...TableEntryCache.TableEntry) *FakeEnv {
@@ -109,12 +112,17 @@ func newFakeEnv(entries ...TableEntryCache.TableEntry) *FakeEnv {
 }
 
 func (fakeenv *FakeEnv) GetTableEntryByServiceIP(addr netip.Addr) resolver.ServiceLookup {
+	fakeenv.tableLookups++
 	entries, generation := fakeenv.table.SearchByServiceIP(addr)
 	return resolver.ServiceLookup{Entries: entries, Generation: generation}
 }
 
 func (fakeenv *FakeEnv) GetInstanceIP(addr netip.Addr, version uint8) (netip.Addr, bool) {
 	return fakeenv.table.SearchInstanceIPByNsIP(addr, version)
+}
+
+func (fakeenv *FakeEnv) TableGeneration() uint64 {
+	return fakeenv.table.Generation()
 }
 
 // replaceJob models a route refresh arriving from the cluster.

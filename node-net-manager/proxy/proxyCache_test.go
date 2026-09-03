@@ -29,21 +29,21 @@ func reverse(t *testing.T, dp *Datapath, wire []byte) string {
 }
 
 // cachedRoute looks up a flow's cached route the same way outgoingProxy does
-// on a cache hit: against the flow's own current table generation, so a hit
-// always takes the fast path regardless of what else has happened to the
-// table in the meantime.
-func cachedRoute(t *testing.T, dp *Datapath, protocol uint8, srcIP, srcInstanceIP, dstServiceIP string, srcPort, dstPort int) (Route, bool) {
+// on a cache hit: against the current table generation, so a hit always takes
+// the fast path regardless of what else has happened to the table in the
+// meantime.
+func cachedRoute(t *testing.T, dp *Datapath, protocol uint8, srcIP, dstServiceIP string, srcPort, dstPort int) (Route, bool) {
 	t.Helper()
-	dst := mustAddr(dstServiceIP)
-	lookup := dp.environment.GetTableEntryByServiceIP(dst)
-	return dp.proxycache.Route(FlowKey{
-		Protocol:      protocol,
-		SrcIP:         mustAddr(srcIP),
-		SrcInstanceIP: mustAddr(srcInstanceIP),
-		DstServiceIP:  dst,
-		SrcPort:       srcPort,
-		DstPort:       dstPort,
-	}, lookup)
+	key := FlowKey{
+		Protocol:     protocol,
+		SrcIP:        mustAddr(srcIP),
+		DstServiceIP: mustAddr(dstServiceIP),
+		SrcPort:      srcPort,
+		DstPort:      dstPort,
+	}
+	var route Route
+	ok := dp.proxycache.Lookup(&key, dp.environment.TableGeneration(), &route)
+	return route, ok
 }
 
 // routeGenOf reads the generation tag off a cached entry directly, since the
@@ -84,10 +84,10 @@ func TestFlowCacheTwoServiceIPsSameSourcePort(t *testing.T) {
 	}
 
 	// Both mappings must still be there.
-	if _, ok := cachedRoute(t, dp, iputils.ProtoTCP, clientNsIP, clientInstIP, serverVIP, 40000, 443); !ok {
+	if _, ok := cachedRoute(t, dp, iputils.ProtoTCP, clientNsIP, serverVIP, 40000, 443); !ok {
 		t.Error("first flow's cache entry was destroyed by the second insert")
 	}
-	if _, ok := cachedRoute(t, dp, iputils.ProtoTCP, clientNsIP, clientInstIP, otherVIP, 40000, 443); !ok {
+	if _, ok := cachedRoute(t, dp, iputils.ProtoTCP, clientNsIP, otherVIP, 40000, 443); !ok {
 		t.Error("second flow's cache entry is missing")
 	}
 }
@@ -118,10 +118,10 @@ func TestFlowCacheSeparatesProtocols(t *testing.T) {
 	translate(t, dp, buildTestPacketV4(t, clientNsIP, serverVIP, 40000, 443))
 	translate(t, dp, buildUDPv4(t, clientNsIP, serverVIP, 40000, 443, []byte("hello")))
 
-	if _, ok := cachedRoute(t, dp, iputils.ProtoTCP, clientNsIP, clientInstIP, serverVIP, 40000, 443); !ok {
+	if _, ok := cachedRoute(t, dp, iputils.ProtoTCP, clientNsIP, serverVIP, 40000, 443); !ok {
 		t.Fatal("TCP flow's cache entry was destroyed by the UDP insert")
 	}
-	if _, ok := cachedRoute(t, dp, iputils.ProtoUDP, clientNsIP, clientInstIP, serverVIP, 40000, 443); !ok {
+	if _, ok := cachedRoute(t, dp, iputils.ProtoUDP, clientNsIP, serverVIP, 40000, 443); !ok {
 		t.Fatal("UDP flow's cache entry is missing")
 	}
 
@@ -150,7 +150,7 @@ func TestFlowCacheMultipleUDPDestinations(t *testing.T) {
 		translate(t, dp, buildUDPv4(t, clientNsIP, v.vip, 40000, 53, []byte("q")))
 	}
 	for _, v := range vips {
-		r, ok := cachedRoute(t, dp, iputils.ProtoUDP, clientNsIP, clientInstIP, v.vip, 40000, 53)
+		r, ok := cachedRoute(t, dp, iputils.ProtoUDP, clientNsIP, v.vip, 40000, 53)
 		if !ok {
 			t.Errorf("lost the cache entry for %s", v.vip)
 			continue

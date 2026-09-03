@@ -33,6 +33,10 @@ type Resolver interface {
 	// packet path reads nothing else off it, and copying a TableEntry per
 	// packet to get at one address dominated the outgoing path
 	GetInstanceIP(addr netip.Addr, version uint8) (netip.Addr, bool)
+	// the current table generation, cheap enough to read on every packet -
+	// an unchanged generation is what lets the datapath reuse a cached route
+	// without consulting the table at all
+	TableGeneration() uint64
 }
 
 // LocalDeployments decouples the MQTT interest bookkeeping below from the
@@ -253,6 +257,12 @@ func (r *ServiceResolver) queryTable(addr netip.Addr) ([]TableEntryCache.TableEn
 // deployed services.
 func (r *ServiceResolver) GetInstanceIP(addr netip.Addr, version uint8) (netip.Addr, bool) {
 	return r.translationTable.SearchInstanceIPByNsIP(addr, version)
+}
+
+// TableGeneration returns the translation table's current generation. Read on
+// every packet, so it takes no lock - see TableManager.Generation.
+func (r *ServiceResolver) TableGeneration() uint64 {
+	return r.translationTable.Generation()
 }
 
 // RefreshServiceTable force a table query refresh for a service

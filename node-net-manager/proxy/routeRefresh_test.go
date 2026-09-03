@@ -31,8 +31,8 @@ func TestCachedRouteSurvivesUnchangedTable(t *testing.T) {
 
 // TestCachedRouteRevalidatedOnce checks that a route survives one
 // revalidation scan after the table's generation moves, and that the next
-// call trusts the retagged generation instead of scanning again - the second
-// call is handed a lookup whose Entries would fail that scan if it ran.
+// lookup trusts the retagged generation instead of scanning again - the
+// second revalidation is handed Entries that would fail the scan if it ran.
 func TestCachedRouteRevalidatedOnce(t *testing.T) {
 	dp := getFakeDatapath()
 	environment := dp.environment.(*FakeEnv)
@@ -40,28 +40,32 @@ func TestCachedRouteRevalidatedOnce(t *testing.T) {
 	translate(t, dp, buildTestPacketV4(t, clientNsIP, serverVIP, 40000, 443))
 
 	key := FlowKey{
-		Protocol:      iputils.ProtoTCP,
-		SrcIP:         mustAddr(clientNsIP),
-		SrcInstanceIP: mustAddr(clientInstIP),
-		DstServiceIP:  mustAddr(serverVIP),
-		SrcPort:       40000,
-		DstPort:       443,
+		Protocol:     iputils.ProtoTCP,
+		SrcIP:        mustAddr(clientNsIP),
+		DstServiceIP: mustAddr(serverVIP),
+		SrcPort:      40000,
+		DstPort:      443,
 	}
 
 	// Bump the table generation without changing serverapp's route at all.
 	environment.replaceJob(t, fixtureEntries[1].JobName, fixtureEntries[1])
 	entries, generation := environment.table.SearchByServiceIP(mustAddr(serverVIP))
 
-	if _, ok := dp.proxycache.Route(key, resolver.ServiceLookup{Entries: entries, Generation: generation}); !ok {
+	var route Route
+	if dp.proxycache.Lookup(&key, generation, &route) {
+		t.Fatal("a route tagged with an older generation should not be trusted on the fast path")
+	}
+	lookup := resolver.ServiceLookup{Entries: entries, Generation: generation}
+	if _, ok := dp.proxycache.Revalidate(key, mustAddr(clientInstIP), 4, lookup); !ok {
 		t.Fatal("a route that is still valid should survive revalidation")
 	}
 	if got := routeGenOf(t, dp, key.Protocol, clientNsIP, clientInstIP, serverVIP, key.SrcPort, key.DstPort); got != generation {
 		t.Fatalf("cached route not retagged after revalidation: generation %d, want %d", got, generation)
 	}
 
-	// The generation now matches, so this lookup must be trusted on the tag
-	// alone: its empty Entries would fail IsRouteStillValid if it ran.
-	if _, ok := dp.proxycache.Route(key, resolver.ServiceLookup{Generation: generation}); !ok {
+	// The generation now matches, so the fast path must take the route on the
+	// tag alone, without a scan it could fail.
+	if !dp.proxycache.Lookup(&key, generation, &route) {
 		t.Error("a cached route was rescanned (and failed) instead of trusting its generation tag")
 	}
 }

@@ -60,6 +60,10 @@ func (e *resolvingEnv) GetInstanceIP(addr netip.Addr, version uint8) (netip.Addr
 	return e.table.SearchInstanceIPByNsIP(addr, version)
 }
 
+func (e *resolvingEnv) TableGeneration() uint64 {
+	return e.table.Generation()
+}
+
 // release completes the resolution attempt for addr. succeed=false models an
 // attempt that finished without finding anything.
 func (e *resolvingEnv) release(addr netip.Addr, succeed bool) {

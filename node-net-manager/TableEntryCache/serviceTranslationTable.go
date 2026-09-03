@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"regexp"
 	"sync"
+	"sync/atomic"
 )
 
 // compiled once instead of per isValid call
@@ -37,6 +38,13 @@ func (e *TableEntry) Touch() {
 	if e.activity != nil {
 		e.activity.Touch()
 	}
+}
+
+// Activity exposes the entry's shared per-job activity stamp so a cached
+// route can keep the job's MQTT interest alive without looking the entry up
+// again on every packet. Nil for an entry that never went through Add.
+func (e *TableEntry) Activity() *events.Activity {
+	return e.activity
 }
 
 type ServiceIpType int
@@ -100,8 +108,10 @@ type TableManager struct {
 	byNsIPInstance map[netip.Addr]InstanceAddrs
 	// bumped on every index rebuild; a cached route tagged with the current
 	// generation is known still-valid, so the packet path can skip
-	// rescanning replicas on a hit. Guarded by rwlock like the indexes.
-	generation uint64
+	// rescanning replicas on a hit. Atomic rather than rwlock-guarded so the
+	// packet path can ask "did anything change?" without taking the lock at
+	// all - see Generation.
+	generation atomic.Uint64
 	rwlock     sync.RWMutex
 }
 
@@ -159,7 +169,9 @@ func (t *TableManager) rebuildIndexesLocked() {
 	t.byServiceIP = byServiceIP
 	t.byNsIP = byNsIP
 	t.byNsIPInstance = byNsIPInstance
-	t.generation++
+	// Published last: a reader that sees this generation must be able to see
+	// the indexes it describes.
+	t.generation.Add(1)
 }
 
 func (t *TableManager) Add(entry TableEntry) error {
@@ -289,7 +301,16 @@ func (t *TableManager) SearchByServiceIP(addr netip.Addr) ([]TableEntry, uint64)
 	t.rwlock.RLock()
 	defer t.rwlock.RUnlock()
 	matches := t.byServiceIP[addr]
-	return matches[:len(matches):len(matches)], t.generation
+	return matches[:len(matches):len(matches)], t.generation.Load()
+}
+
+// Generation returns the current index generation without taking the lock.
+// The packet path reads it on every packet to decide whether a cached route
+// still needs checking against the table; a rebuild racing this read just
+// means one more packet takes the old route, the same window the locked read
+// has.
+func (t *TableManager) Generation() uint64 {
+	return t.generation.Load()
 }
 
 // SearchByNsIP looks up a single entry by namespace IP via the index.
@@ -394,11 +415,18 @@ func (t *TableManager) isValid(entry TableEntry) bool {
 	return true
 }
 
-// IsRouteStillValid checks the full route (nsip, node IP, node port) against
-// table, not just nsip: a refresh can reassign an instance to a different
-// node while its nsip stays the same, and an nsip-only check would keep a
-// cached flow tunnelling to the stale node indefinitely.
-func IsRouteStillValid(nsip netip.Addr, nodeip netip.Addr, nodeport int, table []TableEntry) bool {
+// MatchRoute finds the entry a cached route is pinned to, matching the full
+// route (nsip, node IP, node port) rather than just nsip: a refresh can
+// reassign an instance to a different node while its nsip stays the same, and
+// an nsip-only check would keep a cached flow tunnelling to the stale node
+// indefinitely. Returns nil if the instance is no longer in table, so the
+// caller has to choose a new one.
+//
+// The entry itself is returned, not just a yes/no, because a route surviving
+// a table rebuild still has to be refreshed from the entry it survived
+// against - the job's activity stamp is replaced when the job is removed and
+// re-added, and the address its replies come from can change.
+func MatchRoute(nsip netip.Addr, nodeip netip.Addr, nodeport int, table []TableEntry) *TableEntry {
 	for i := range table {
 		entry := &table[i]
 		if entry.Nodeport != nodeport {
@@ -409,11 +437,11 @@ func IsRouteStillValid(nsip netip.Addr, nodeip netip.Addr, nodeport int, table [
 			continue
 		}
 		if entryNsip, ok := AddrFromIP(entry.Nsip); ok && entryNsip == nsip {
-			return true
+			return entry
 		}
 		if entryNsipv6, ok := AddrFromIP(entry.Nsipv6); ok && entryNsipv6 == nsip {
-			return true
+			return entry
 		}
 	}
-	return false
+	return nil
 }

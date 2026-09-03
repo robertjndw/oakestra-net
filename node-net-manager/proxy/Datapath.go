@@ -362,19 +362,17 @@ func (d *Datapath) handleIngoing(buf []byte) Action {
 
 // outgoingProxy rewrites pkt in place if its destination falls in the
 // semantic-routing subnetwork, resolving the target instance via the
-// translation table and the per-flow ProxyCache. ok is false if the packet
-// should be dropped. resolving is non-nil only on a cold miss still being
-// resolved in the background, letting the caller hold the packet for retry
-// instead of losing it.
+// per-flow ProxyCache and - only when that cache can't answer on its own -
+// the translation table. ok is false if the packet should be dropped.
+// resolving is non-nil only on a cold miss still being resolved in the
+// background, letting the caller hold the packet for retry instead of losing
+// it.
 func (d *Datapath) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPort int, resolving <-chan struct{}, ok bool) {
 	dstIP := pkt.DstIP()
-	srcIP := pkt.SrcIP()
-	protocol := pkt.Protocol()
-	srcport := int(pkt.SrcPort())
-	dstport := int(pkt.DstPort())
+	version := pkt.Version()
 
 	var inProxySubnet bool
-	if pkt.Version() == 4 {
+	if version == 4 {
 		inProxySubnet = d.ProxyIPv4Prefix.Contains(dstIP)
 	} else {
 		inProxySubnet = d.ProxyIPv6Prefix.Contains(dstIP)
@@ -383,62 +381,83 @@ func (d *Datapath) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPo
 		return netip.Addr{}, 0, nil, false
 	}
 
-	lookup := d.environment.GetTableEntryByServiceIP(dstIP)
-	if len(lookup.Entries) < 1 {
-		return netip.Addr{}, 0, lookup.Resolving, false
-	}
-
-	instanceIP, ok := d.convertToInstanceIp(pkt.Version(), srcIP)
-	if !ok {
-		return netip.Addr{}, 0, nil, false
-	}
-
 	key := FlowKey{
-		Protocol:      protocol,
-		SrcIP:         srcIP,
-		SrcInstanceIP: instanceIP,
-		DstServiceIP:  dstIP,
-		SrcPort:       srcport,
-		DstPort:       dstport,
+		Protocol:     pkt.Protocol(),
+		SrcIP:        pkt.SrcIP(),
+		DstServiceIP: dstIP,
+		SrcPort:      int(pkt.SrcPort()),
+		DstPort:      int(pkt.DstPort()),
 	}
 
-	route, usable := d.proxycache.Route(key, lookup)
-	if !usable {
-		// TODO: only does round-robin so far; ServiceIP policies belong here.
-		// rand.IntN is safe for concurrent use unlike a shared *rand.Rand -
-		// needed since replay goroutines can call in here too.
-		tableEntry := &lookup.Entries[rand.IntN(len(lookup.Entries))]
-
-		entryDstIPnet := tableEntry.Nsip
-		if pkt.Version() == 6 {
-			entryDstIPnet = tableEntry.Nsipv6
-		}
-		entryDstIP, ok := TableEntryCache.AddrFromIP(entryDstIPnet)
+	// Steady state: the flow is cached and the translation table has not been
+	// rebuilt since its route was chosen, so the route is known current and
+	// this packet never touches the table at all. Everything below is the
+	// cold path - a new flow, or a table that has moved on.
+	var route Route
+	if !d.proxycache.Lookup(&key, d.environment.TableGeneration(), &route) {
+		route, resolving, ok = d.resolveRoute(key, version)
 		if !ok {
-			return netip.Addr{}, 0, nil, false
+			return netip.Addr{}, 0, resolving, false
 		}
-		nodeAddr, ok := TableEntryCache.AddrFromIP(tableEntry.Nodeip)
-		if !ok {
-			return netip.Addr{}, 0, nil, false
-		}
-
-		// dstNode/dstNodePort are cached here too, since an Nsip is only ever
-		// valid on the node that issued it - no need to look it back up by
-		// Nsip on every packet.
-		route = Route{
-			SrcInstanceIP: instanceIP,
-			DstIP:         entryDstIP,
-			DstNode:       nodeAddr,
-			DstNodePort:   tableEntry.Nodeport,
-		}
-		d.proxycache.Install(key, route,
-			TableEntryCache.InstanceAddrsOf(tableEntry).For(pkt.Version()), lookup.Generation)
 	}
 
 	if !pkt.Rewrite(route.SrcInstanceIP, route.DstIP) {
 		return netip.Addr{}, 0, nil, false
 	}
 	return route.DstNode, route.DstNodePort, nil, true
+}
+
+// resolveRoute picks the route for a flow Lookup couldn't answer for: either
+// it has never been seen, or the table has changed since its route was
+// chosen. Off the steady-state path, so it is the only place that consults
+// the translation table.
+func (d *Datapath) resolveRoute(key FlowKey, version uint8) (Route, <-chan struct{}, bool) {
+	lookup := d.environment.GetTableEntryByServiceIP(key.DstServiceIP)
+	if len(lookup.Entries) < 1 {
+		return Route{}, lookup.Resolving, false
+	}
+
+	instanceIP, ok := d.convertToInstanceIp(version, key.SrcIP)
+	if !ok {
+		return Route{}, nil, false
+	}
+
+	// A flow that already exists keeps the replica it was pinned to, as long
+	// as that replica is still in the table - only a genuinely new or broken
+	// flow gets to pick.
+	if route, revalidated := d.proxycache.Revalidate(key, instanceIP, version, lookup); revalidated {
+		return route, nil, true
+	}
+
+	// TODO: only does round-robin so far; ServiceIP policies belong here.
+	// rand.IntN is safe for concurrent use unlike a shared *rand.Rand -
+	// needed since replay goroutines can call in here too.
+	tableEntry := &lookup.Entries[rand.IntN(len(lookup.Entries))]
+
+	entryDstIPnet := tableEntry.Nsip
+	if version == 6 {
+		entryDstIPnet = tableEntry.Nsipv6
+	}
+	entryDstIP, ok := TableEntryCache.AddrFromIP(entryDstIPnet)
+	if !ok {
+		return Route{}, nil, false
+	}
+	nodeAddr, ok := TableEntryCache.AddrFromIP(tableEntry.Nodeip)
+	if !ok {
+		return Route{}, nil, false
+	}
+
+	// dstNode/dstNodePort are cached here too, since an Nsip is only ever
+	// valid on the node that issued it - no need to look it back up by
+	// Nsip on every packet.
+	route := Route{
+		SrcInstanceIP: instanceIP,
+		DstIP:         entryDstIP,
+		DstNode:       nodeAddr,
+		DstNodePort:   tableEntry.Nodeport,
+	}
+	d.proxycache.Install(key, route, tableEntry, version, lookup.Generation)
+	return route, nil, true
 }
 
 // convertToInstanceIp resolves the stable "instance IP" that identifies
