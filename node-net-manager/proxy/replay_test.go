@@ -56,8 +56,8 @@ func (e *resolvingEnv) GetTableEntryByServiceIP(addr netip.Addr) resolver.Servic
 	return resolver.ServiceLookup{Entries: entries, Generation: generation}
 }
 
-func (e *resolvingEnv) GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool) {
-	return e.table.SearchByNsIP(addr)
+func (e *resolvingEnv) GetInstanceIP(addr netip.Addr, version uint8) (netip.Addr, bool) {
+	return e.table.SearchInstanceIPByNsIP(addr, version)
 }
 
 // release completes the resolution attempt for addr. succeed=false models an

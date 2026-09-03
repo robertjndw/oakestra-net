@@ -113,8 +113,8 @@ func (fakeenv *FakeEnv) GetTableEntryByServiceIP(addr netip.Addr) resolver.Servi
 	return resolver.ServiceLookup{Entries: entries, Generation: generation}
 }
 
-func (fakeenv *FakeEnv) GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool) {
-	return fakeenv.table.SearchByNsIP(addr)
+func (fakeenv *FakeEnv) GetInstanceIP(addr netip.Addr, version uint8) (netip.Addr, bool) {
+	return fakeenv.table.SearchInstanceIPByNsIP(addr, version)
 }
 
 // replaceJob models a route refresh arriving from the cluster.

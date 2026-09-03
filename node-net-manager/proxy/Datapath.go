@@ -407,7 +407,7 @@ func (d *Datapath) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPo
 		// TODO: only does round-robin so far; ServiceIP policies belong here.
 		// rand.IntN is safe for concurrent use unlike a shared *rand.Rand -
 		// needed since replay goroutines can call in here too.
-		tableEntry := lookup.Entries[rand.IntN(len(lookup.Entries))]
+		tableEntry := &lookup.Entries[rand.IntN(len(lookup.Entries))]
 
 		entryDstIPnet := tableEntry.Nsip
 		if pkt.Version() == 6 {
@@ -431,7 +431,8 @@ func (d *Datapath) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPo
 			DstNode:       nodeAddr,
 			DstNodePort:   tableEntry.Nodeport,
 		}
-		d.proxycache.Install(key, route, instanceAddrOf(&tableEntry, pkt.Version()), lookup.Generation)
+		d.proxycache.Install(key, route,
+			TableEntryCache.InstanceAddrsOf(tableEntry).For(pkt.Version()), lookup.Generation)
 	}
 
 	if !pkt.Rewrite(route.SrcInstanceIP, route.DstIP) {
@@ -440,34 +441,15 @@ func (d *Datapath) outgoingProxy(pkt *iputils.Packet) (dstHost netip.Addr, dstPo
 	return route.DstNode, route.DstNodePort, nil, true
 }
 
-// instanceAddrOf returns the "instance IP" that uniquely identifies one
-// deployed instance of a service, in the requested address family. It is the
-// address that instance's own proxy will source its replies from.
-func instanceAddrOf(entry *TableEntryCache.TableEntry, version uint8) netip.Addr {
-	for _, sip := range entry.ServiceIP {
-		if sip.IpType != TableEntryCache.InstanceNumber {
-			continue
-		}
-		instanceIPnet := sip.Address
-		if version == 6 {
-			instanceIPnet = sip.Address_v6
-		}
-		addr, _ := TableEntryCache.AddrFromIP(instanceIPnet)
-		return addr
-	}
-	return netip.Addr{}
-}
-
 // convertToInstanceIp resolves the stable "instance IP" that identifies
 // srcIP's own service instance, for use as the translated source address.
 func (d *Datapath) convertToInstanceIp(version uint8, srcIP netip.Addr) (netip.Addr, bool) {
-	instanceTableEntry, instanceexist := d.environment.GetTableEntryByNsIP(srcIP)
-	if !instanceexist {
+	addr, ok := d.environment.GetInstanceIP(srcIP, version)
+	if !ok {
 		logger.ErrorLogger().Println("Unable to find instance IP for service: ", srcIP)
 		return netip.Addr{}, false
 	}
-	addr := instanceAddrOf(&instanceTableEntry, version)
-	return addr, addr.IsValid()
+	return addr, true
 }
 
 // ingoingProxy checks the ProxyCache for a reverse mapping (a flow this node

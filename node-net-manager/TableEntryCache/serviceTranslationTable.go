@@ -53,6 +53,38 @@ type ServiceIP struct {
 	Address_v6 net.IP        `json:"address_v6"`
 }
 
+// InstanceAddrs is the packet path's slice of a TableEntry: the two addresses
+// that identify one deployed instance, without the ~200 bytes of job metadata
+// around them. The packet path reads nothing else off an entry, and copying a
+// whole TableEntry to get at these was the single most expensive thing the
+// outgoing path did.
+type InstanceAddrs struct{ V4, V6 netip.Addr }
+
+// For returns the instance address in the requested address family.
+func (a InstanceAddrs) For(version uint8) netip.Addr {
+	if version == 6 {
+		return a.V6
+	}
+	return a.V4
+}
+
+// InstanceAddrsOf returns the addresses that uniquely identify one deployed
+// instance of a service - the ones its own proxy sources replies from. Every
+// caller must agree on this rule, since a route installed under one reading of
+// it is later matched against replies under another.
+func InstanceAddrsOf(entry *TableEntry) InstanceAddrs {
+	for _, sip := range entry.ServiceIP {
+		if sip.IpType != InstanceNumber {
+			continue
+		}
+		var addrs InstanceAddrs
+		addrs.V4, _ = AddrFromIP(sip.Address)
+		addrs.V6, _ = AddrFromIP(sip.Address_v6)
+		return addrs
+	}
+	return InstanceAddrs{}
+}
+
 type TableManager struct {
 	translationTable []TableEntry
 	// address indexes for SearchByServiceIP/SearchByNsIP; hold copies, not
@@ -60,6 +92,12 @@ type TableManager struct {
 	// reallocated. Rebuilt wholesale on every mutation.
 	byServiceIP map[netip.Addr][]TableEntry
 	byNsIP      map[netip.Addr]TableEntry
+	// byNsIPInstance answers the packet path's only question about a namespace
+	// IP. Kept separate from byNsIP rather than derived from it per packet: the
+	// selection rule below is fixed at rebuild time, so a lookup costs one
+	// 48-byte map read instead of copying a whole TableEntry and rescanning its
+	// ServiceIP slice on every packet.
+	byNsIPInstance map[netip.Addr]InstanceAddrs
 	// bumped on every index rebuild; a cached route tagged with the current
 	// generation is known still-valid, so the packet path can skip
 	// rescanning replicas on a hit. Guarded by rwlock like the indexes.
@@ -72,6 +110,7 @@ func NewTableManager() TableManager {
 		translationTable: make([]TableEntry, 0),
 		byServiceIP:      make(map[netip.Addr][]TableEntry),
 		byNsIP:           make(map[netip.Addr]TableEntry),
+		byNsIPInstance:   make(map[netip.Addr]InstanceAddrs),
 		rwlock:           sync.RWMutex{},
 	}
 	// TODO cleanup of old entry every X seconds
@@ -97,12 +136,16 @@ func AddrFromIP(ip net.IP) (netip.Addr, bool) {
 func (t *TableManager) rebuildIndexesLocked() {
 	byServiceIP := make(map[netip.Addr][]TableEntry, len(t.byServiceIP))
 	byNsIP := make(map[netip.Addr]TableEntry, len(t.translationTable))
-	for _, entry := range t.translationTable {
+	byNsIPInstance := make(map[netip.Addr]InstanceAddrs, len(t.translationTable))
+	for i, entry := range t.translationTable {
+		instance := InstanceAddrsOf(&t.translationTable[i])
 		if addr, ok := AddrFromIP(entry.Nsip); ok {
 			byNsIP[addr] = entry
+			byNsIPInstance[addr] = instance
 		}
 		if addr, ok := AddrFromIP(entry.Nsipv6); ok {
 			byNsIP[addr] = entry
+			byNsIPInstance[addr] = instance
 		}
 		for _, sip := range entry.ServiceIP {
 			if addr, ok := AddrFromIP(sip.Address); ok {
@@ -115,6 +158,7 @@ func (t *TableManager) rebuildIndexesLocked() {
 	}
 	t.byServiceIP = byServiceIP
 	t.byNsIP = byNsIP
+	t.byNsIPInstance = byNsIPInstance
 	t.generation++
 }
 
@@ -254,6 +298,21 @@ func (t *TableManager) SearchByNsIP(addr netip.Addr) (TableEntry, bool) {
 	defer t.rwlock.RUnlock()
 	entry, found := t.byNsIP[addr]
 	return entry, found
+}
+
+// SearchInstanceIPByNsIP resolves the instance address that identifies addr's
+// own service instance, in the requested address family. This is the packet
+// path's lookup: unlike SearchByNsIP it copies one address out of the index
+// rather than a whole TableEntry.
+func (t *TableManager) SearchInstanceIPByNsIP(addr netip.Addr, version uint8) (netip.Addr, bool) {
+	t.rwlock.RLock()
+	instance, found := t.byNsIPInstance[addr]
+	t.rwlock.RUnlock()
+	if !found {
+		return netip.Addr{}, false
+	}
+	result := instance.For(version)
+	return result, result.IsValid()
 }
 
 func (t *TableManager) SearchByNodeIp(ip net.IP) []TableEntry {

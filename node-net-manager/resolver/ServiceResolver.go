@@ -29,7 +29,10 @@ type ServiceLookup struct {
 type Resolver interface {
 	// starts background resolution on a miss instead of blocking - see resolveServiceIPOnce
 	GetTableEntryByServiceIP(addr netip.Addr) ServiceLookup
-	GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool)
+	// resolves only the instance address, not the whole table entry: the
+	// packet path reads nothing else off it, and copying a TableEntry per
+	// packet to get at one address dominated the outgoing path
+	GetInstanceIP(addr netip.Addr, version uint8) (netip.Addr, bool)
 }
 
 // LocalDeployments decouples the MQTT interest bookkeeping below from the
@@ -244,10 +247,12 @@ func (r *ServiceResolver) queryTable(addr netip.Addr) ([]TableEntryCache.TableEn
 	return tableQueryByIP(addr)
 }
 
-// GetTableEntryByNsIP Given a NamespaceIP finds the table entry. This search is local because the networking component MUST have all
-// the entries for the local deployed services.
-func (r *ServiceResolver) GetTableEntryByNsIP(addr netip.Addr) (TableEntryCache.TableEntry, bool) {
-	return r.translationTable.SearchByNsIP(addr)
+// GetInstanceIP Given a NamespaceIP finds the instance address identifying that
+// service instance, in the requested address family. This search is local
+// because the networking component MUST have all the entries for the local
+// deployed services.
+func (r *ServiceResolver) GetInstanceIP(addr netip.Addr, version uint8) (netip.Addr, bool) {
+	return r.translationTable.SearchInstanceIPByNsIP(addr, version)
 }
 
 // RefreshServiceTable force a table query refresh for a service
