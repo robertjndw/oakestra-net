@@ -1,9 +1,46 @@
 package proxy
 
 import (
+	"NetManager/clock"
 	"NetManager/proxy/iputils"
+	"net/netip"
 	"testing"
+	"time"
 )
+
+func newTestProxyCache() *ProxyCache {
+	return &ProxyCache{
+		cache: make([]conversionBucket, 65536),
+		frags: newFragmentCache(),
+	}
+}
+
+func flowCacheTestEntry(id, srcPort int) ConversionEntry {
+	octet := byte(id)
+	return ConversionEntry{
+		srcip:         netip.AddrFrom4([4]byte{10, 19, 1, 1}),
+		dstip:         netip.AddrFrom4([4]byte{10, 19, 2, octet}),
+		dstServiceIp:  netip.AddrFrom4([4]byte{10, 30, 0, octet}),
+		srcInstanceIp: netip.AddrFrom4([4]byte{10, 30, 1, 1}),
+		dstInstanceIp: netip.AddrFrom4([4]byte{10, 30, 2, octet}),
+		srcport:       srcPort,
+		dstport:       443,
+		protocol:      iputils.ProtoTCP,
+		dstNode:       netip.AddrFrom4([4]byte{10, 0, 0, octet}),
+		dstNodePort:   tunnelPort,
+		routeGen:      1,
+	}
+}
+
+func flowKeyOf(entry ConversionEntry) FlowKey {
+	return FlowKey{
+		Protocol:     entry.protocol,
+		SrcIP:        entry.srcip,
+		DstServiceIP: entry.dstServiceIp,
+		SrcPort:      entry.srcport,
+		DstPort:      entry.dstport,
+	}
+}
 
 // translate runs one outgoing packet through the datapath and returns the
 // node it was forwarded to, leaving the flow in the cache.
@@ -158,5 +195,87 @@ func TestFlowCacheMultipleUDPDestinations(t *testing.T) {
 		if r.DstNode.String() != v.node {
 			t.Errorf("%s cached node = %s; want %s", v.vip, r.DstNode, v.node)
 		}
+	}
+}
+
+func TestFlowCacheEvictsOnlyIdleEntries(t *testing.T) {
+	cache := newTestProxyCache()
+	idle := flowCacheTestEntry(1, 40000)
+	active := flowCacheTestEntry(2, 40001)
+	cache.Add(idle)
+	cache.Add(active)
+
+	shard := shardOf(idle.srcport)
+	cache.locks[shard].Lock()
+	cache.cache[idle.srcport].entries[0].lastUsed = clock.Unix() - 61
+	cache.locks[shard].Unlock()
+
+	cache.evictOldEntries(time.Minute)
+
+	if got := len(cache.cache[idle.srcport].entries); got != 0 {
+		t.Errorf("idle bucket contains %d entries after eviction; want 0", got)
+	}
+	if got := len(cache.cache[active.srcport].entries); got != 1 {
+		t.Errorf("active bucket contains %d entries after eviction; want 1", got)
+	}
+}
+
+func TestFlowCacheLookupRefreshesIdleEntry(t *testing.T) {
+	cache := newTestProxyCache()
+	entry := flowCacheTestEntry(1, 40000)
+	cache.Add(entry)
+
+	shard := shardOf(entry.srcport)
+	cache.locks[shard].Lock()
+	cache.cache[entry.srcport].entries[0].lastUsed = clock.Unix() - 61
+	cache.locks[shard].Unlock()
+
+	key := flowKeyOf(entry)
+	var route Route
+	if !cache.Lookup(&key, entry.routeGen, &route) {
+		t.Fatal("expected the existing flow to be found")
+	}
+	cache.evictOldEntries(time.Minute)
+
+	if got := len(cache.cache[entry.srcport].entries); got != 1 {
+		t.Errorf("recently used bucket contains %d entries after eviction; want 1", got)
+	}
+}
+
+func TestFlowCacheCapacityRecyclesLeastRecentlyUsed(t *testing.T) {
+	cache := newTestProxyCache()
+	const srcPort = 40000
+	for id := 1; id <= maxFlowsPerPort; id++ {
+		cache.Add(flowCacheTestEntry(id, srcPort))
+	}
+
+	// Age a flow in the middle of the bucket, not the first one: recycling
+	// slot 0 blindly would otherwise look like a correct LRU choice.
+	const stale = maxFlowsPerPort / 2
+	shard := shardOf(srcPort)
+	cache.locks[shard].Lock()
+	cache.cache[srcPort].entries[stale].lastUsed = clock.Unix() - 61
+	cache.locks[shard].Unlock()
+
+	replacement := flowCacheTestEntry(maxFlowsPerPort+1, srcPort)
+	cache.Add(replacement)
+
+	bucket := cache.cache[srcPort].entries
+	if got := len(bucket); got != maxFlowsPerPort {
+		t.Fatalf("full bucket contains %d entries; want %d", got, maxFlowsPerPort)
+	}
+
+	oldest := flowKeyOf(flowCacheTestEntry(stale+1, srcPort))
+	replacementKey := flowKeyOf(replacement)
+	foundOldest, foundReplacement := false, false
+	for i := range bucket {
+		foundOldest = foundOldest || bucket[i].matchesFlow(&oldest)
+		foundReplacement = foundReplacement || bucket[i].matchesFlow(&replacementKey)
+	}
+	if foundOldest {
+		t.Error("least recently used flow remained in a full bucket")
+	}
+	if !foundReplacement {
+		t.Error("new flow was not inserted into the full bucket")
 	}
 }

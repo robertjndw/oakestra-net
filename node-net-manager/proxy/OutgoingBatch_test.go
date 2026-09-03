@@ -218,6 +218,46 @@ func TestOutgoingBatchOnePeerFailureDoesNotBlockOthers(t *testing.T) {
 	}
 }
 
+func TestOutgoingBatchReusesHighFanoutGroups(t *testing.T) {
+	const peers = 128
+	batch := newOutgoingBatch(peers)
+	destinations := make([]netip.AddrPort, peers)
+	for i := range destinations {
+		destinations[i] = netip.AddrPortFrom(
+			netip.AddrFrom4([4]byte{10, 0, 0, byte(i + 1)}), uint16(tunnelPort))
+		batch.group(destinations[i], []byte{byte(i)})
+	}
+
+	if batch.liveGroups != peers {
+		t.Fatalf("first batch contains %d destination groups; want %d", batch.liveGroups, peers)
+	}
+
+	// Reuse the retained slots in reverse order. Each slot's packet slice
+	// must be cleared even though the slots themselves remain allocated.
+	batch.liveGroups = 0
+	for i := peers - 1; i >= 0; i-- {
+		batch.group(destinations[i], []byte{byte(i)})
+	}
+
+	if batch.liveGroups != peers {
+		t.Fatalf("reused batch contains %d destination groups; want %d", batch.liveGroups, peers)
+	}
+	for i := 0; i < peers; i++ {
+		group := batch.groups[i]
+		want := destinations[peers-1-i]
+		if group.dst != want {
+			t.Errorf("group %d destination = %s; want %s", i, group.dst, want)
+		}
+		if len(group.bufs) != 1 {
+			t.Errorf("group %d retained %d packets; want 1", i, len(group.bufs))
+			continue
+		}
+		if got, wantPacket := group.bufs[0][0], byte(peers-1-i); got != wantPacket {
+			t.Errorf("group %d contains packet %d; want %d", i, got, wantPacket)
+		}
+	}
+}
+
 // TestSendOverTunnelBatchSurvivesNegativeWriteCount checks that a failed
 // batched send doesn't take the outgoing loop down with it. Linux reports the
 // failure as -1, and peers restarting make that routine: their ICMP

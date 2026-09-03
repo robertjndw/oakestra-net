@@ -213,3 +213,95 @@ func TestConcurrentDirectionsShareAFlow(t *testing.T) {
 		t.Error(failure)
 	}
 }
+
+// TestConcurrentTableRefreshWhileFlowIsBusy combines the two production
+// packet loops with repeated table generation changes. The outgoing loop
+// must safely revalidate the entry while the incoming loop is matching and
+// touching the same entry.
+func TestConcurrentTableRefreshWhileFlowIsBusy(t *testing.T) {
+	dp := getFakeDatapath()
+	environment := dp.environment.(*FakeEnv)
+	translate(t, dp, buildTestPacketV4(t, clientNsIP, serverVIP, 40000, 443))
+
+	outgoing := buildTestPacketV4(t, clientNsIP, serverVIP, 40000, 443)
+	incoming := buildTestPacketV4(t, serverInstIP, clientNsIP, 443, 40000)
+	wantNode := mustAddr(nodeBIP)
+	wantOutgoingSrc := mustAddr(clientInstIP)
+	wantOutgoingDst := mustAddr(serverNsIP)
+	wantIncomingSrc := mustAddr(serverVIP)
+	wantIncomingDst := mustAddr(clientNsIP)
+	forward := make(chan struct{}, 1)
+	reverse := make(chan struct{}, 1)
+	results := make(chan string, 2)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, len(outgoing))
+		for range forward {
+			copy(buf, outgoing)
+			pkt, ok := iputils.Parse(buf)
+			if !ok {
+				results <- "outgoing packet stopped parsing"
+				continue
+			}
+			dstNode, dstPort, _, ok := dp.outgoingProxy(&pkt)
+			if !ok {
+				results <- "forward route disappeared during table refresh"
+				continue
+			}
+			if dstNode != wantNode || dstPort != tunnelPort {
+				results <- "forward route changed during unrelated table refresh"
+				continue
+			}
+			if pkt.SrcIP() != wantOutgoingSrc || pkt.DstIP() != wantOutgoingDst {
+				results <- "outgoing packet was rewritten to the wrong addresses"
+				continue
+			}
+			results <- ""
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, len(incoming))
+		for range reverse {
+			copy(buf, incoming)
+			pkt, ok := iputils.Parse(buf)
+			if !ok {
+				results <- "incoming packet stopped parsing"
+				continue
+			}
+			if !dp.ingoingProxy(&pkt) {
+				results <- "reverse route disappeared during table refresh"
+				continue
+			}
+			if pkt.SrcIP() != wantIncomingSrc || pkt.DstIP() != wantIncomingDst {
+				results <- "incoming packet was rewritten to the wrong addresses"
+				continue
+			}
+			results <- ""
+		}
+	}()
+
+	for range 500 {
+		// An unrelated route update still bumps the global generation and
+		// therefore forces this flow through Revalidate.
+		environment.replaceJob(t, fixtureEntries[2].JobName, fixtureEntries[2])
+		forward <- struct{}{}
+		reverse <- struct{}{}
+		for range 2 {
+			if failure := <-results; failure != "" {
+				t.Error(failure)
+			}
+		}
+	}
+	close(forward)
+	close(reverse)
+	wg.Wait()
+
+	if got, want := routeGenOf(t, dp, iputils.ProtoTCP, clientNsIP, clientInstIP,
+		serverVIP, 40000, 443), environment.TableGeneration(); got != want {
+		t.Errorf("cached route generation = %d; want current generation %d", got, want)
+	}
+}
