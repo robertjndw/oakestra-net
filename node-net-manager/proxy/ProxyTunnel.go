@@ -152,7 +152,7 @@ func (t *Tunnel) tunOutgoingListen() {
 	go t.outgoingLoop(readerror)
 
 	t.isListening = true
-	logger.InfoLogger().Println("GoProxyTunnel outgoing listening started")
+	logger.InfoLogger().Println("Tunnel outgoing listening started")
 	for {
 		select {
 		case stopmsg := <-t.stopChannel:
@@ -179,7 +179,7 @@ func (t *Tunnel) tunIngoingListen() {
 	go t.ingoingLoop(readerror)
 
 	t.isListening = true
-	logger.InfoLogger().Println("GoProxyTunnel ingoing listening started")
+	logger.InfoLogger().Println("Tunnel ingoing listening started")
 	for {
 		select {
 		case stopmsg := <-t.stopChannel:

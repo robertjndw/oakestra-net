@@ -264,9 +264,9 @@ func TestFragmentCacheBounded(t *testing.T) {
 	}
 }
 
-// TestUnknownLaterFragmentDropped: a fragment whose first fragment was never
-// seen here cannot be made consistent with its siblings, so it must not be
-// forwarded.
+// TestUnknownLaterFragmentDropped checks that a fragment whose first fragment
+// was never seen here is dropped: there is no way to make it consistent with
+// its siblings.
 func TestUnknownLaterFragmentDropped(t *testing.T) {
 	dp := getFakeDatapath()
 	wire := buildUDPv4(t, clientNsIP, serverVIP, 40000, 53, largePayload(2000))

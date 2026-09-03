@@ -7,10 +7,10 @@ import (
 	"time"
 )
 
-// TestCachedRouteSurvivesUnchangedTable: while the translation table has not
-// moved, a cached flow keeps its route and is tagged with the current
-// generation, which is what lets the packet path skip rescanning every replica
-// of the service on each hit.
+// TestCachedRouteSurvivesUnchangedTable checks that while the translation
+// table has not moved, a cached flow keeps its route and is tagged with the
+// current generation, which is what lets the packet path skip rescanning
+// every replica of the service on each hit.
 func TestCachedRouteSurvivesUnchangedTable(t *testing.T) {
 	dp := getFakeDatapath()
 	environment := dp.environment.(*FakeEnv)
@@ -70,7 +70,7 @@ func TestCachedRouteRevalidatedOnce(t *testing.T) {
 	}
 }
 
-// TestCachedRouteFollowsNodeChange: a refresh can move an instance to another
+// TestCachedRouteFollowsNodeChange covers a refresh moving an instance to another
 // node while its namespace IP stays the same. A cached flow that only compared
 // namespace IPs would keep tunnelling to the old node forever, because cache
 // hits refresh the entry's own idle timer.
@@ -108,9 +108,9 @@ func TestCachedRouteFollowsNodeChange(t *testing.T) {
 	}
 }
 
-// TestCachedRouteDroppedWhenInstanceRemoved: once the only instance is gone
-// there is no route to fall back on, so the packet must be dropped rather than
-// sent to the stale node.
+// TestCachedRouteDroppedWhenInstanceRemoved checks that once the only
+// instance is gone there is no route to fall back on, so the packet is dropped
+// rather than sent to the stale node.
 func TestCachedRouteDroppedWhenInstanceRemoved(t *testing.T) {
 	dp := getFakeDatapath()
 	environment := dp.environment.(*FakeEnv)

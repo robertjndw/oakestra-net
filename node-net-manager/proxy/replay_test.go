@@ -179,8 +179,8 @@ func TestReplayPreservesOrder(t *testing.T) {
 	}
 }
 
-// TestReplaySeparateVIPsResolveIndependently: one Service IP resolving must
-// not flush packets waiting on another.
+// TestReplaySeparateVIPsResolveIndependently checks that one Service IP
+// resolving does not flush packets waiting on another.
 func TestReplaySeparateVIPsResolveIndependently(t *testing.T) {
 	dp, sink, resolving := coldDatapath(t)
 
@@ -210,8 +210,8 @@ func TestReplaySeparateVIPsResolveIndependently(t *testing.T) {
 	}
 }
 
-// TestReplayQueueBounded: the queue is capped, and the cap is expressed in
-// packets actually retained rather than pooled 64KiB buffers.
+// TestReplayQueueBounded checks that the queue is capped, and that the cap
+// counts packets actually retained rather than pooled 64KiB buffers.
 func TestReplayQueueBounded(t *testing.T) {
 	dp, _, _ := coldDatapath(t)
 
@@ -234,8 +234,9 @@ func TestReplayQueueBounded(t *testing.T) {
 	}
 }
 
-// TestReplayFailedResolutionReleasesQueue: an attempt that finishes without
-// resolving anything must drop its queue rather than re-queue it forever.
+// TestReplayFailedResolutionReleasesQueue checks that an attempt finishing
+// without resolving anything drops its queue rather than re-queueing it
+// forever.
 func TestReplayFailedResolutionReleasesQueue(t *testing.T) {
 	dp, _, resolving := coldDatapath(t)
 
@@ -313,7 +314,7 @@ func TestReplayHoldsLaterFragmentsOfAColdDatagram(t *testing.T) {
 	}
 }
 
-// TestLaterFragmentNeverStartsAResolution: a later fragment carries no
+// TestLaterFragmentNeverStartsAResolution covers the fact that a later fragment carries no
 // transport ports, so it cannot drive a route lookup of its own. With nothing
 // already waiting on its destination there is no first fragment for it to stay
 // consistent with, and it must simply be dropped.
@@ -331,8 +332,9 @@ func TestLaterFragmentNeverStartsAResolution(t *testing.T) {
 	}
 }
 
-// TestReplayFragmentQueueRespectsBounds: fragments queue through the same
-// bounded FIFO as everything else, so a flood cannot grow it without limit.
+// TestReplayFragmentQueueRespectsBounds checks that fragments queue through
+// the same bounded FIFO as everything else, so a flood cannot grow it without
+// limit.
 func TestReplayFragmentQueueRespectsBounds(t *testing.T) {
 	dp, _, _ := coldDatapath(t)
 

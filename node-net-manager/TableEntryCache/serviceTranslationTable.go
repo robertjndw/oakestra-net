@@ -64,8 +64,7 @@ type ServiceIP struct {
 // InstanceAddrs is the packet path's slice of a TableEntry: the two addresses
 // that identify one deployed instance, without the ~200 bytes of job metadata
 // around them. The packet path reads nothing else off an entry, and copying a
-// whole TableEntry to get at these was the single most expensive thing the
-// outgoing path did.
+// whole TableEntry per packet to get at these dominated the outgoing path.
 type InstanceAddrs struct{ V4, V6 netip.Addr }
 
 // For returns the instance address in the requested address family.
@@ -141,8 +140,8 @@ func AddrFromIP(ip net.IP) (netip.Addr, bool) {
 	return addr.Unmap(), true
 }
 
-// rebuildIndexesLocked recomputes byServiceIP/byNsIP from translationTable.
-// Caller must hold rwlock for writing.
+// rebuildIndexesLocked recomputes all three address indexes from
+// translationTable. Caller must hold rwlock for writing.
 func (t *TableManager) rebuildIndexesLocked() {
 	byServiceIP := make(map[netip.Addr][]TableEntry, len(t.byServiceIP))
 	byNsIP := make(map[netip.Addr]TableEntry, len(t.translationTable))

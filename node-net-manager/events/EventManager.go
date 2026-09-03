@@ -16,9 +16,9 @@ type Activity struct {
 }
 
 // Touch records that target was just used. It runs on the packet path, so it
-// reads the shared coarse clock rather than calling time.Now() itself; the
-// interest timeouts this feeds are minutes long, so a second of slack is
-// irrelevant to them.
+// reads the shared coarse clock rather than calling time.Now() itself. The
+// only consumer is mqtt's idle check, which sleeps in whole seconds anyway,
+// so sub-second precision would buy it nothing.
 //
 // The store is skipped when the stamp already reads the current second, which
 // is the case for all but the first packet of each second. One Activity is

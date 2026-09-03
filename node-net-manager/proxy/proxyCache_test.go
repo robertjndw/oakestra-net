@@ -107,9 +107,9 @@ func routeGenOf(t *testing.T, dp *Datapath, protocol uint8, srcIP, srcInstanceIP
 	return 0
 }
 
-// TestFlowCacheTwoServiceIPsSameSourcePort: two flows from the same local
-// socket to different Service VIPs on the same destination port must not
-// collide in the same source-port bucket.
+// TestFlowCacheTwoServiceIPsSameSourcePort checks that two flows from the
+// same local socket to different Service VIPs on the same destination port do
+// not collide in the same source-port bucket.
 func TestFlowCacheTwoServiceIPsSameSourcePort(t *testing.T) {
 	dp := getFakeDatapath()
 

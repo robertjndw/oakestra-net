@@ -45,7 +45,7 @@ func TestWarmFlowSkipsTheTable(t *testing.T) {
 	}
 }
 
-// TestWarmFlowKeepsJobInterestAlive: the fast path skips the table, and the
+// TestWarmFlowKeepsJobInterestAlive covers the consequence of skipping the table: the
 // table lookup is what used to keep the destination job's MQTT interest from
 // self-destructing. The cached flow has to carry that job's activity stamp
 // itself, or a busy long-lived flow would have its own route torn out from
@@ -61,7 +61,7 @@ func TestWarmFlowKeepsJobInterestAlive(t *testing.T) {
 	}
 }
 
-// TestRevalidatedFlowAdoptsTheNewJobStamp: a job that is removed and
+// TestRevalidatedFlowAdoptsTheNewJobStamp covers a job that is removed and
 // redeployed onto the same node and namespace IP gets a fresh activity stamp,
 // and its old one is never polled again. A revalidated flow that kept touching
 // the retired stamp would let the redeployed job's interest self-destruct
@@ -91,10 +91,11 @@ func TestRevalidatedFlowAdoptsTheNewJobStamp(t *testing.T) {
 	}
 }
 
-// TestRevalidatedFlowRefreshesTheReplySource: replies are matched against the
-// address the destination instance sources them from, so a revalidated flow
-// has to pick up that address afresh - otherwise a redeploy that changes it
-// leaves every reply on a still-valid route unmatched.
+// TestRevalidatedFlowRefreshesTheReplySource checks that a revalidated flow
+// picks up its reply source afresh. Replies are matched against the address
+// the destination instance sources them from, so a redeploy that changes that
+// address would otherwise leave every reply on a still-valid route
+// unmatched.
 func TestRevalidatedFlowRefreshesTheReplySource(t *testing.T) {
 	dp := getFakeDatapath()
 	environment := dp.environment.(*FakeEnv)
@@ -118,7 +119,7 @@ func TestRevalidatedFlowRefreshesTheReplySource(t *testing.T) {
 	}
 }
 
-// TestFlowSurvivesAnInstanceIPChange: the source instance IP is no longer part
+// TestFlowSurvivesAnInstanceIPChange covers the source instance IP no longer being part
 // of the flow key, so a table refresh that changes it has to refresh the
 // cached flow rather than leave it stranded behind a key that no longer
 // matches.
@@ -146,9 +147,9 @@ func TestFlowSurvivesAnInstanceIPChange(t *testing.T) {
 	}
 }
 
-// TestRevalidationKeepsThePinnedReplica: a table rebuild that leaves a flow's
-// replica in place must not reroute that flow - an established connection
-// moved to another replica mid-stream is a broken connection.
+// TestRevalidationKeepsThePinnedReplica checks that a table rebuild leaving a
+// flow's replica in place does not reroute that flow - an established
+// connection moved to another replica mid-stream is a broken connection.
 func TestRevalidationKeepsThePinnedReplica(t *testing.T) {
 	dp := fakeDatapathOn(nodeAIP, newFakeEnv(replicatedFixture(t, 8)...))
 	environment := dp.environment.(*FakeEnv)
