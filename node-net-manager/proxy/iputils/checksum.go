@@ -13,31 +13,46 @@ import "encoding/binary"
 //
 // which generalizes to replacing several 16-bit words at once by summing
 // ~m_i for every old word and m'_i for every new word before folding.
+//
+// The sum is accumulated 32 bits at a time rather than 16. RFC 1071 permits
+// deferring the carries, and a 32-bit word's two halves land at different
+// positions in the accumulator, so folding at the end is equivalent to having
+// summed the halves separately - at a quarter of the loads.
 
-// foldCarry reduces a 32-bit accumulator down to a 16-bit one's-complement
-// sum by repeatedly folding the carry bits back in.
-func foldCarry(sum uint32) uint16 {
-	for sum>>16 != 0 {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
+// foldCarry reduces a deferred-carry accumulator to a 16-bit one's-complement
+// sum. Deliberately unrolled rather than looping until it converges: the
+// widest sum this package builds is 16 complemented 32-bit words plus a
+// checksum (under 2^40), for which this fixed sequence always converges, and a
+// data-dependent loop on the packet path buys nothing.
+func foldCarry(sum uint64) uint16 {
+	sum = (sum >> 32) + (sum & 0xffffffff)
+	sum = (sum >> 16) + (sum & 0xffff)
+	sum = (sum >> 16) + (sum & 0xffff)
+	sum = (sum >> 16) + (sum & 0xffff)
 	return uint16(sum)
 }
 
 // checksumAdjust applies the RFC 1624 incremental update to checksum (as
-// stored on the wire, big-endian) for replacing the bytes in old with the
-// bytes in new. old and new must be the same length and an even number of
-// bytes (they're read as consecutive 16-bit big-endian words).
-func checksumAdjust(checksum uint16, old, new []byte) uint16 {
-	sum := uint32(^checksum) & 0xffff
-	for i := 0; i+1 < len(old); i += 2 {
-		w := uint32(old[i])<<8 | uint32(old[i+1])
-		sum += (^w) & 0xffff
-	}
-	for i := 0; i+1 < len(new); i += 2 {
-		w := uint32(new[i])<<8 | uint32(new[i+1])
-		sum += w
-	}
-	return ^foldCarry(sum)
+// stored on the wire, big-endian) for a field replacement whose delta - the
+// deferred-carry sum of ~old and new over the replaced words - the caller has
+// already accumulated. See addrDelta4/addrDelta16.
+func checksumAdjust(checksum uint16, delta uint64) uint16 {
+	return ^foldCarry(uint64(^checksum) + delta)
+}
+
+// addrDelta4 is the delta contributed by replacing one 4-byte address.
+func addrDelta4(old []byte, new *[4]byte) uint64 {
+	return uint64(^readUint32(old)) + uint64(readUint32(new[:]))
+}
+
+// addrDelta16 is the delta contributed by replacing one 16-byte address, read
+// as four 32-bit words per side.
+func addrDelta16(old []byte, new *[16]byte) uint64 {
+	_ = old[15] // one bounds check up front instead of four
+	return uint64(^readUint32(old[0:4])) + uint64(^readUint32(old[4:8])) +
+		uint64(^readUint32(old[8:12])) + uint64(^readUint32(old[12:16])) +
+		uint64(readUint32(new[0:4])) + uint64(readUint32(new[4:8])) +
+		uint64(readUint32(new[8:12])) + uint64(readUint32(new[12:16]))
 }
 
 func readUint16(b []byte) uint16 {
@@ -49,5 +64,5 @@ func writeUint16(b []byte, v uint16) {
 }
 
 func readUint32(b []byte) uint32 {
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+	return binary.BigEndian.Uint32(b)
 }
