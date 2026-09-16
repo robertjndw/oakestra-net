@@ -11,6 +11,9 @@ import (
 
 var subnetworkResponseChannel chan mqttSubnetworkResponse
 
+// subnetworkTimeout is a variable so tests can shorten it.
+var subnetworkTimeout = 10 * time.Second
+
 type mqttSubnetworkResponse struct {
 	Address    string `json:"address"`
 	Address_v6 string `json:"addressv6"`
@@ -55,7 +58,7 @@ func RequestSubnetworkMqttBlocking() (mqttSubnetworkResponse, error) {
 		if result.Address != "" || result.Address_v6 != "" {
 			return result, nil
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(subnetworkTimeout):
 		log.Printf("TIMEOUT - Table query without response, quitting goroutine")
 	}
 

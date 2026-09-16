@@ -20,6 +20,10 @@ var (
 
 /*-----------------------------------*/
 
+// tableQueryTimeout is a variable so tests can shorten it. The doc comments below still say
+// 10 seconds, but 5 seconds is what the select actually waits.
+var tableQueryTimeout = 5 * time.Second
+
 /*----- Mqtt Table query cache classes and interfaces -----*/
 type TablequeryMqttInterface interface {
 	TableQueryByIpRequestBlocking(sip string, force_optional ...bool) (TableQueryResponse, error)
@@ -122,7 +126,7 @@ func (cache *TableQueryRequestCache) tableQueryRequestBlocking(sip string, sname
 	select {
 	case result := <-responseChannel:
 		return result, nil
-	case <-time.After(5 * time.Second):
+	case <-time.After(tableQueryTimeout):
 		logger.ErrorLogger().Printf("TIMEOUT - Table query without response, quitting goroutine")
 	}
 

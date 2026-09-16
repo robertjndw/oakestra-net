@@ -14,6 +14,10 @@ import (
 var runningHandlers = utils.NewStringSlice()
 var runningHandlersLock sync.RWMutex
 
+// selfDestructTimeout is a variable so tests can shorten it. The doc comment on
+// startSelfDestructTimeout still talks about 5 minutes, but 10 seconds is what ships.
+var selfDestructTimeout = 10 * time.Second
+
 type jobUpdatesTimer struct {
 	eventManager events.EventManager
 	job          string
@@ -51,7 +55,7 @@ func (jut *jobUpdatesTimer) startSelfDestructTimeout() {
 			//event received, reset timer
 			logger.DebugLogger().Printf("received packet event from: %s", jut.job)
 			continue
-		case <-time.After(10 * time.Second):
+		case <-time.After(selfDestructTimeout):
 			if !jut.env.IsServiceDeployed(jut.job) {
 				//timeout ----> job no longer required. Let's clear the interest
 				log.Printf("De-registering from %s", jut.job)

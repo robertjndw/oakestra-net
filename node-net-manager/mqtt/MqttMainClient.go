@@ -14,6 +14,9 @@ import (
 
 var initMqttClient sync.Once
 
+// newClient is a variable (not a direct call to mqtt.NewClient) so tests can substitute a fake paho client.
+var newClient = mqtt.NewClient
+
 type NetMqttClient struct {
 	topics                 map[string]mqtt.MessageHandler
 	clientID               string
@@ -118,7 +121,7 @@ func GetNetMqttClient() *NetMqttClient {
 }
 
 func (netmqtt *NetMqttClient) runMqttClient(opts *mqtt.ClientOptions) {
-	netmqtt.mainMqttClient = mqtt.NewClient(opts)
+	netmqtt.mainMqttClient = newClient(opts)
 	if token := netmqtt.mainMqttClient.Connect(); token.Wait() && token.Error() != nil {
 		panic(token.Error())
 	}
