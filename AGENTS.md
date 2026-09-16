@@ -24,11 +24,15 @@ cd node-net-manager/build && ./build.sh
 # Install on this machine
 ./install.sh amd64   # or arm64
 
-# Run tests
+# Run tests (the full tree only builds on Linux because of netlink; the mqtt package also builds on macOS)
 cd node-net-manager && go test ./...
 
 # Run a single test package
 cd node-net-manager && go test ./proxy/...
+
+# MQTT characterization tests. Broker-backed integration tests run only when
+# OAKESTRA_TEST_MQTT_ADDR=host:port points at a live MQTT broker, otherwise they skip.
+cd node-net-manager && go test -race ./mqtt/
 
 # Run the daemon (requires root)
 sudo NetManager
@@ -42,7 +46,9 @@ pip install -r requirements.txt
 
 # Run tests
 cd root-service-manager/service-manager && pytest
-cd cluster-service-manager/service-manager && pytest
+cd cluster-service-manager/service-manager && pip install -r requirements-test.txt && pytest
+# cluster-service-manager MQTT tests: see cluster-service-manager/service-manager/tests/README.md.
+# Broker-backed integration tests run only when OAKESTRA_TEST_MQTT_ADDR=host:port is set.
 
 # Build Docker images
 cd root-service-manager && docker build -t local_root_service_manager service-manager/
@@ -153,3 +159,4 @@ Set `"Debug": true` to enable verbose logging to `/var/log/oakestra/netmanager.l
 - Go tests run on every push via `.github/workflows/node_net_manager_tests.yml`
 - Python tests for both service managers run on every push via `root_tests.yml` and `cluster_tests.yml`
 - Docker images are built and published via `root_service_manager_image.yml` and `cluster_service_manager_image.yml`
+- Golden MQTT payloads shared by the cluster-service-manager and node-net-manager test suites live in `testdata/mqtt_contract/` (see its README). Change a fixture only together with both suites.
