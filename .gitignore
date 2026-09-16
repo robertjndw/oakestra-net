@@ -21,3 +21,7 @@ bin/
 .pytest_cache/
 __pycache__/
 .idea/
+
+# local virtualenvs for the Python test suites
+.venv/
+venv/
