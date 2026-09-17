@@ -30,9 +30,9 @@ cd node-net-manager && go test ./...
 # Run a single test package
 cd node-net-manager && go test ./proxy/...
 
-# MQTT characterization tests. Broker-backed integration tests run only when
+# clusterlink characterization tests. Broker-backed integration tests run only when
 # OAKESTRA_TEST_MQTT_ADDR=host:port points at a live MQTT broker, otherwise they skip.
-cd node-net-manager && go test -race ./mqtt/
+cd node-net-manager && go test -race ./clusterlink/
 
 # Run the daemon (requires root)
 sudo NetManager
@@ -80,7 +80,7 @@ Port `50103` is reserved and cannot be used by deployed services.
 
 - **`env/`** — EnvironmentManager: creates/destroys network namespaces, maintains the translation table, dispatches between container (`env/ContainerNetDeployment.go`) and unikernel (`env/UnikernelNetDeployment.go`) deployments
 - **`proxy/`** — ProxyTunnel: intercepts traffic destined for Service VIPs, resolves them via the translation table, and forwards via TUN; uses `github.com/google/gopacket` and `github.com/songgao/water`
-- **`mqtt/`** — subscribes to cluster MQTT topics for route/table-query updates; implements interest registration with a self-destruct timeout when a service is no longer needed
+- **`clusterlink/`** - NetManager's link to the cluster: owns the message bus connection (built on the shared `oakestra_messaging_go` library), subscribes to cluster topics for route/table-query updates, and implements interest registration with a self-destruct timeout when a service is no longer needed
 - **`network/`** — iptables rule management (`network/iptables.go`) and NAT utilities
 - **`handlers/`** — dispatches deployment/removal requests to the correct manager (container vs unikernel)
 - **`server/`** — HTTP REST API accepting requests from NodeEngine (Unix socket at `/etc/netmanager/netmanager.sock`)
@@ -99,7 +99,7 @@ Port `50103` is reserved and cannot be used by deployed services.
 
 ### cluster-service-manager internals (Python/Flask)
 
-- **`interfaces/mqtt_client.py`** — MQTT client (paho-mqtt) connecting to cluster broker
+- **`interfaces/workerlink.py`** - cluster-service-manager's link to the workers: builds the message bus from env (via the shared `oakestra_messaging` library) and subscribes to the six node topics
 - **`interfaces/root_service_manager_requests.py`** — HTTP calls to root service manager
 - **`operations/`** — handles instance deployment/undeployment, propagates routes down to nodes via MQTT
 
@@ -127,6 +127,8 @@ node-net-manager config at `/etc/netmanager/netcfg.json`:
 
 Set `"Debug": true` to enable verbose logging to `/var/log/oakestra/netmanager.log`.
 
+node-net-manager also reads `MESSAGING_BACKEND` from the environment (default and only valid value `mqtt`); any other value makes the `/register` HTTP handler answer 500 instead of connecting to the cluster.
+
 ## Runtime Environment Variables
 
 ### root-service-manager
@@ -145,6 +147,7 @@ Set `"Debug": true` to enable verbose logging to `/var/log/oakestra/netmanager.l
 |---|---|---|
 | `CLUSTER_MONGO_URL` | — | MongoDB host |
 | `CLUSTER_MONGO_PORT` | — | MongoDB port (typically `10108`) |
+| `MESSAGING_BACKEND` | `mqtt` | Selects the message bus backend; `mqtt` is currently the only valid value. Any other value makes cluster-service-manager exit at startup with `unsupported MESSAGING_BACKEND ...`. |
 | `MQTT_BROKER_URL` | — | MQTT broker host |
 | `MQTT_BROKER_PORT` | — | MQTT broker port (typically `10003`) |
 | `ROOT_SERVICE_MANAGER_URL` | `0.0.0.0` | root-service-manager host |
@@ -153,6 +156,15 @@ Set `"Debug": true` to enable verbose logging to `/var/log/oakestra/netmanager.l
 | `MY_PORT` | `10200` | Port this service listens on |
 
 ---
+
+## Depends on oakestra shared libraries
+
+Both service managers get their messaging interface from the `oakestra` repo's `libraries/` folder instead of talking to paho directly:
+
+- **cluster-service-manager** pins `oakestra_messaging` as a git dependency in `cluster-service-manager/service-manager/requirements.txt` (currently `@feat/add-pub-sub-interface`; re-pin to a commit SHA once that branch is stable, and to a tag once it merges into `develop`). To bump it, edit the ref in `requirements.txt` and reinstall (`pip install -r requirements-test.txt`).
+- **node-net-manager** requires `github.com/oakestra/oakestra/libraries/oakestra_messaging_go` in `node-net-manager/go.mod`, currently redirected with a temporary `replace` to a local sibling checkout of that branch. Once the branch is pushed, remove the `replace` and run `go get github.com/oakestra/oakestra/libraries/oakestra_messaging_go@feat/add-pub-sub-interface`; after it merges, tag the library `libraries/oakestra_messaging_go/vX.Y.Z` in oakestra and run `go get .../oakestra_messaging_go@vX.Y.Z`.
+
+**Gotcha:** never run `go get -u` in `node-net-manager`. The library is an untagged subdirectory module today, so `-u` resolves "latest" to whatever commit sits on oakestra's default branch instead of the pinned feature branch, and it bumps every other dependency at the same time. CI uses `go mod download` for this reason.
 
 ## CI
 
