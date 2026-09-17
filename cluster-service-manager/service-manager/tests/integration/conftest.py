@@ -14,10 +14,9 @@ import uuid
 
 import paho.mqtt.client as paho_mqtt
 import pytest
+from oakestra_messaging import MqttBus
 
-from interfaces import mqtt_client
-
-SUBACK_TIMEOUT = 5
+from interfaces import workerlink
 
 
 @pytest.fixture
@@ -50,38 +49,21 @@ def wait_until():
 
 
 @pytest.fixture
-def csm_client(broker_addr, monkeypatch):
-    """Run the real mqtt_init() against the test broker.
+def csm_bus(broker_addr):
+    """Run the real workerlink wiring against the test broker.
 
-    Waits for the SUBACK on `nodes/+/net/#` before handing control back, by
-    monkeypatching handle_connect itself (patched before mqtt_init() is
-    called, so mqtt_init's `mqtt.on_connect = handle_connect` picks up the
-    wrapped version) rather than racing to attach on_subscribe after the
-    fact.
+    MqttBus.connect() blocks until the broker has acked every subscribed
+    pattern, so it's safe to hand control back to the test right after.
     """
     host, port = broker_addr
-    monkeypatch.setenv("MQTT_BROKER_URL", host)
-    monkeypatch.setenv("MQTT_BROKER_PORT", str(port))
-    monkeypatch.delenv("MQTT_CERT", raising=False)
+    bus = MqttBus(host, port, qos=1)
+    workerlink.start(bus)
+    bus.connect()
 
-    subscribed = threading.Event()
-    original_handle_connect = mqtt_client.handle_connect
+    yield bus
 
-    def handle_connect_and_signal(client, userdata, flags, rc):
-        client.on_subscribe = lambda *a, **kw: subscribed.set()
-        original_handle_connect(client, userdata, flags, rc)
-
-    monkeypatch.setattr(mqtt_client, "handle_connect", handle_connect_and_signal)
-
-    mqtt_client.mqtt_init(None)
-    if not subscribed.wait(timeout=SUBACK_TIMEOUT):
-        pytest.fail("CSM client never received a SUBACK for nodes/+/net/#")
-
-    yield mqtt_client.mqtt
-
-    mqtt_client.mqtt.loop_stop()
-    mqtt_client.mqtt.disconnect()
-    mqtt_client.mqtt = None
+    bus.close()
+    workerlink._bus = None
 
 
 class Peer:

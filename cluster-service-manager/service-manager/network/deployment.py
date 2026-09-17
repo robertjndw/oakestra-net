@@ -1,5 +1,5 @@
-from interfaces import mongodb_requests, mqtt_client
-from interfaces.root_service_manager_requests import *
+from interfaces import mongodb_requests
+from interfaces.root_service_manager_requests import system_manager_notify_deployment_status
 
 
 def deployment_status_report(
@@ -25,6 +25,3 @@ def deployment_address_update(appname, node_id, instance_number, host_ip, host_p
 
     # Notify System manager
     system_manager_notify_deployment_status(job, node_id)
-
-    # Notify all interested worker nodes of the address change
-    mqtt_client.mqtt_notify_service_change(appname, type="DEPLOYMENT")

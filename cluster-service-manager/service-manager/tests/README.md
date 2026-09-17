@@ -11,6 +11,11 @@ cd cluster-service-manager/service-manager
 uv venv --python 3.10 .venv
 source .venv/bin/activate
 uv pip install -r requirements-test.txt
+
+# requirements.txt pins oakestra_messaging to a git URL; for local dev against
+# a checked-out oakestra worktree, install it editable instead so edits there
+# take effect immediately:
+uv pip install -e <path-to-oakestra>/libraries/oakestra_messaging
 ```
 
 ## Running
@@ -40,33 +45,26 @@ MQTT-compatibility mode without changing these tests.
 ## Fixtures
 
 `tests/conftest.py` provides:
-- `mqtt_mock`: patches the module-level `interfaces.mqtt_client.mqtt`
-  client (production code always reaches it through that global, never a
-  parameter).
-- `make_message`: builds a fake paho `MQTTMessage` for
-  `handle_mqtt_message()`.
+- `bus`: an `InMemoryBus` wired up via `workerlink.start()`, so production
+  code always reaches it through the module-level `interfaces.workerlink._bus`
+  global (never a parameter). Tests inject inbound messages with
+  `bus.deliver(topic, payload)` and inspect outbound ones via `bus.published`.
 - `contract`: loads a golden payload from
   `../../../testdata/mqtt_contract/<name>.json` (see that directory's
   README for the full topic/payload table).
 
 `tests/integration/conftest.py` additionally provides `broker_addr`,
-`node_id` (fresh per test), `csm_client` (a real, connected CSM MQTT
-client), `peer` (a real paho client standing in for a worker's NetManager,
-subscribed to `nodes/<node_id>/net/#`), and `wait_until` (a small polling
-helper for assertions that can't be tied to a wire message).
-
-## The star-import caveat
-
-`interfaces/mqtt_client.py` has no `import os` or `import json` of its
-own. Both arrive transitively through `from network.deployment import *`.
-Don't "fix" that while patching things in this module; it's part of the
-characterized behavior, not an oversight to clean up.
+`node_id` (fresh per test), `csm_bus` (a real `MqttBus` wired to workerlink
+and connected to the test broker), `peer` (a real paho client standing in for
+a worker's NetManager, subscribed to `nodes/<node_id>/net/#`), and
+`wait_until` (a small polling helper for assertions that can't be tied to a
+wire message).
 
 ## `tests/__init__.py`
 
 Stubs `interfaces.mongodb_requests` in `sys.modules` *before* any other
-test module is collected/imported, so importing `interfaces.mqtt_client`
+test module is collected/imported, so importing `interfaces.workerlink`
 (which does `from interfaces.mongodb_requests import
 mongo_find_node_by_id_and_update_subnetwork`) never touches a real Mongo
 connection. Never import `service_manager.py` in a test, it calls
-`mqtt_init()`/`mongo_init()` at import time.
+`workerlink.start()`/`bus.connect()`/`mongo_init()` at import time.

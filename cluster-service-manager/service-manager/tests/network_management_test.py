@@ -2,8 +2,8 @@ from unittest.mock import MagicMock, patch
 import sys
 from network import deployment
 from network.tablequery import interests
-from interfaces.mqtt_client import _tablequery_handler
-from interfaces import mqtt_client
+from interfaces.workerlink import _tablequery_handler
+from interfaces import workerlink
 
 mongodb_client = sys.modules["interfaces.mongodb_requests"]
 
@@ -79,7 +79,7 @@ def test_deployment_status_report(requests_mock):
 def test_tablequery_service_ip_local(add_interest):
     job = _get_fake_job("aaa")
     mongodb_client.mongo_find_job_by_ip = MagicMock(return_value=job)
-    mqtt_client.mqtt_publish_tablequery_result = MagicMock()
+    workerlink.publish_tablequery_result = MagicMock()
     job_instance = job["instance_list"][0]
 
     _tablequery_handler("baba", {"sip": "172.30.0.1"})
@@ -97,7 +97,7 @@ def test_tablequery_service_ip_local(add_interest):
             "Address_v6": job["service_ip_list"][0]["Address_v6"],
         },
     ]
-    mqtt_client.mqtt_publish_tablequery_result.assert_called_with(
+    workerlink.publish_tablequery_result.assert_called_with(
         "baba",
         {
             "app_name": "aaa",
@@ -111,7 +111,7 @@ def test_tablequery_service_ip_local(add_interest):
 def test_tablequery_service_name_local(add_interest):
     job = _get_fake_job("aaa")
     mongodb_client.mongo_find_job_by_name = MagicMock(return_value=job.copy())
-    mqtt_client.mqtt_publish_tablequery_result = MagicMock()
+    workerlink.publish_tablequery_result = MagicMock()
     job_instance = job["instance_list"][0]
 
     _tablequery_handler("baba", {"sname": "aaa"})
@@ -129,7 +129,7 @@ def test_tablequery_service_name_local(add_interest):
             "Address_v6": job["service_ip_list"][0]["Address_v6"],
         },
     ]
-    mqtt_client.mqtt_publish_tablequery_result.assert_called_with(
+    workerlink.publish_tablequery_result.assert_called_with(
         "baba",
         {
             "app_name": "aaa",
@@ -155,7 +155,7 @@ def test_tablequery_service_ip_root(add_interest, requests_mock):
     )
     mongodb_client.mongo_find_job_by_ip = MagicMock(return_value=None)
     mongodb_client.mongo_insert_job = MagicMock()
-    mqtt_client.mqtt_publish_tablequery_result = MagicMock()
+    workerlink.publish_tablequery_result = MagicMock()
 
     _tablequery_handler("baba", {"sip": "172.30.0.1"})
 
@@ -173,7 +173,7 @@ def test_tablequery_service_ip_root(add_interest, requests_mock):
             "Address_v6": job_instance["instance_ip_v6"],
         },
     ]
-    mqtt_client.mqtt_publish_tablequery_result.assert_called_with(
+    workerlink.publish_tablequery_result.assert_called_with(
         "baba",
         {
             "app_name": "aaa",
@@ -196,7 +196,7 @@ def test_tablequery_service_name_root(add_interest, requests_mock):
     )
     mongodb_client.mongo_find_job_by_name = MagicMock(return_value=None)
     mongodb_client.mongo_insert_job = MagicMock()
-    mqtt_client.mqtt_publish_tablequery_result = MagicMock()
+    workerlink.publish_tablequery_result = MagicMock()
 
     _tablequery_handler("baba", {"sname": "aaa"})
 
@@ -214,7 +214,7 @@ def test_tablequery_service_name_root(add_interest, requests_mock):
             "Address_v6": job_instance["instance_ip_v6"],
         },
     ]
-    mqtt_client.mqtt_publish_tablequery_result.assert_called_with(
+    workerlink.publish_tablequery_result.assert_called_with(
         "baba",
         {
             "app_name": "aaa",

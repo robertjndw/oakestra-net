@@ -1,21 +1,21 @@
 import json
+import logging
 from unittest.mock import MagicMock
 
 import pytest
+from oakestra_messaging import Message
 
-from interfaces import mqtt_client
-from interfaces.mqtt_client import (
+from interfaces import workerlink
+from interfaces.workerlink import (
     _address_handler,
     _deployment_handler,
     _interest_remove_handler,
     _subnet_handler,
     _tablequery_handler,
     _undeployment_handler,
-    handle_connect,
-    handle_mqtt_message,
-    mqtt_notify_service_change,
-    mqtt_publish_subnetwork_result,
-    mqtt_publish_tablequery_result,
+    notify_service_change,
+    publish_subnetwork_result,
+    publish_tablequery_result,
 )
 
 HANDLER_NAMES = [
@@ -34,40 +34,29 @@ def all_handlers_mocked(monkeypatch):
     mocks = {}
     for name in HANDLER_NAMES:
         mock = MagicMock()
-        monkeypatch.setattr(mqtt_client, name, mock)
+        monkeypatch.setattr(workerlink, name, mock)
         mocks[name] = mock
     return mocks
 
 
-def _dispatch(make_message, topic, payload):
-    handle_mqtt_message(MagicMock(), MagicMock(), make_message(topic, payload))
-
-
 # --------------------------------------------------------------------------- #
-# handle_connect
+# start()
 # --------------------------------------------------------------------------- #
 
 
-def test_handle_connect_subscribes_net_wildcard_qos1(mqtt_mock):
-    handle_connect(MagicMock(), None, {}, 0)
-
-    mqtt_mock.subscribe.assert_called_once_with(topic="nodes/+/net/#", qos=1)
-
-
-def test_handle_connect_ignores_its_client_argument(mqtt_mock):
-    # handle_connect subscribes via the module-global `mqtt`, not the `client`
-    # paho hands it. In production these are the same object; passing a distinct
-    # object here shows the parameter is unused.
-    unrelated_client = MagicMock()
-
-    handle_connect(unrelated_client, None, {}, 0)
-
-    unrelated_client.subscribe.assert_not_called()
-    mqtt_mock.subscribe.assert_called_once_with(topic="nodes/+/net/#", qos=1)
+def test_start_subscribes_exactly_six_patterns(bus):
+    assert bus.subscriptions == [
+        "nodes/+/net/service/deployed",
+        "nodes/+/net/service/undeployed",
+        "nodes/+/net/service/address-changed",
+        "nodes/+/net/tablequery/request",
+        "nodes/+/net/subnet",
+        "nodes/+/net/interest/remove",
+    ]
 
 
 # --------------------------------------------------------------------------- #
-# handle_mqtt_message dispatch
+# dispatch
 # --------------------------------------------------------------------------- #
 
 
@@ -82,12 +71,10 @@ def test_handle_connect_ignores_its_client_argument(mqtt_mock):
         ("nodes/n1/net/interest/remove", "_interest_remove_handler"),
     ],
 )
-def test_dispatch_routes_topic_to_handler(
-    make_message, all_handlers_mocked, topic, handler_name
-):
+def test_dispatch_routes_topic_to_handler(bus, all_handlers_mocked, topic, handler_name):
     payload = {"some": "value"}
 
-    _dispatch(make_message, topic, payload)
+    bus.deliver(topic, json.dumps(payload))
 
     all_handlers_mocked[handler_name].assert_called_once_with("n1", payload)
     for name, mock in all_handlers_mocked.items():
@@ -95,66 +82,69 @@ def test_dispatch_routes_topic_to_handler(
             mock.assert_not_called()
 
 
-def test_subnetwork_result_echo_runs_subnet_handler(make_message, all_handlers_mocked):
-    # The broker echoes CSM's own publishes back to it because of the
-    # `nodes/+/net/#` wildcard subscription. `^nodes/.*/net/subnet` has no
-    # trailing anchor, so it also matches ".../net/subnetwork/result".
+def test_subnetwork_result_echo_not_delivered(bus, all_handlers_mocked):
+    # "nodes/+/net/subnet" has one fewer segment than
+    # "nodes/n1/net/subnetwork/result", so CSM's own subnetwork/result echo
+    # never reaches a handler.
     payload = {"address": "10.19.1.0", "addressv6": "fc00:1::"}
 
-    _dispatch(make_message, "nodes/n1/net/subnetwork/result", payload)
+    delivered = bus.deliver("nodes/n1/net/subnetwork/result", json.dumps(payload))
 
-    all_handlers_mocked["_subnet_handler"].assert_called_once_with("n1", payload)
+    assert delivered == 0
+    for mock in all_handlers_mocked.values():
+        mock.assert_not_called()
 
 
-def test_tablequery_result_echo_runs_no_handler(make_message, all_handlers_mocked):
-    # Unlike the subnet echo above, the tablequery/result echo matches none of
-    # the six regexes (none of them look for ".../net/tablequery/result").
+def test_tablequery_result_echo_runs_no_handler(bus, all_handlers_mocked):
     payload = {"app_name": "a", "instance_list": [], "query_key": "a"}
 
-    _dispatch(make_message, "nodes/n1/net/tablequery/result", payload)
+    bus.deliver("nodes/n1/net/tablequery/result", json.dumps(payload))
 
     for mock in all_handlers_mocked.values():
         mock.assert_not_called()
 
 
-def test_main_repo_topics_run_no_handler(make_message, all_handlers_mocked):
+def test_main_repo_topics_run_no_handler(bus, all_handlers_mocked):
     # CM/NE's own topics never contain "/net/", so they can't match any of
-    # CSM's regexes even though both share one broker.
+    # CSM's patterns even though both share one broker.
     for topic in ("nodes/n1/information", "nodes/n1/job", "nodes/n1/jobs/resources"):
-        _dispatch(make_message, topic, {"anything": "goes"})
+        bus.deliver(topic, json.dumps({"anything": "goes"}))
 
     for mock in all_handlers_mocked.values():
         mock.assert_not_called()
 
 
-def test_client_id_is_second_segment(make_message, all_handlers_mocked):
-    _dispatch(make_message, "nodes/abc-305/net/interest/remove", {"appname": "a"})
+def test_client_id_is_second_segment(bus, all_handlers_mocked):
+    bus.deliver("nodes/abc-305/net/interest/remove", json.dumps({"appname": "a"}))
 
     all_handlers_mocked["_interest_remove_handler"].assert_called_once_with(
         "abc-305", {"appname": "a"}
     )
 
 
-def test_extra_suffix_still_matches(make_message, all_handlers_mocked):
-    # None of the six regexes anchor with `$`, so trailing path segments are
-    # silently accepted.
-    _dispatch(
-        make_message, "nodes/n1/net/service/deployed/unexpected/suffix", {"a": 1}
+def test_extra_suffix_not_delivered(bus, all_handlers_mocked):
+    # None of the six patterns end in "#", so a trailing path segment doesn't match.
+    delivered = bus.deliver(
+        "nodes/n1/net/service/deployed/unexpected/suffix", json.dumps({"a": 1})
     )
 
-    all_handlers_mocked["_deployment_handler"].assert_called_once_with(
-        "n1", {"a": 1}
-    )
-
-
-def test_non_json_payload_raises_before_dispatch(make_message, all_handlers_mocked):
-    message = make_message("nodes/n1/net/subnet", "not-json")
-
-    with pytest.raises(json.JSONDecodeError):
-        handle_mqtt_message(MagicMock(), MagicMock(), message)
-
+    assert delivered == 0
     for mock in all_handlers_mocked.values():
         mock.assert_not_called()
+
+
+def test_malformed_payload_logged_and_next_message_delivered(bus, all_handlers_mocked, caplog):
+    with caplog.at_level(logging.ERROR, logger="oakestra_messaging.dispatch"):
+        bus.deliver("nodes/n1/net/subnet", "not-json")
+
+    assert any(record.exc_info for record in caplog.records)
+    all_handlers_mocked["_subnet_handler"].assert_not_called()
+
+    bus.deliver("nodes/n1/net/subnet", json.dumps({"METHOD": "GET"}))
+
+    all_handlers_mocked["_subnet_handler"].assert_called_once_with(
+        "n1", {"METHOD": "GET"}
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -164,7 +154,7 @@ def test_non_json_payload_raises_before_dispatch(make_message, all_handlers_mock
 
 def test_deployment_handler_forwards_fields_in_order(monkeypatch):
     recorder = MagicMock()
-    monkeypatch.setattr(mqtt_client, "deployment_status_report", recorder)
+    monkeypatch.setattr(workerlink, "deployment_status_report", recorder)
     payload = {
         "appname": "app.ns.svc.inst",
         "status": "DEPLOYED",
@@ -185,7 +175,7 @@ def test_deployment_handler_forwards_fields_in_order(monkeypatch):
 
 def test_deployment_handler_missing_keys_become_none(monkeypatch):
     recorder = MagicMock()
-    monkeypatch.setattr(mqtt_client, "deployment_status_report", recorder)
+    monkeypatch.setattr(workerlink, "deployment_status_report", recorder)
 
     _deployment_handler("n1", {})
 
@@ -194,7 +184,7 @@ def test_deployment_handler_missing_keys_become_none(monkeypatch):
 
 def test_deployment_handler_swallows_exceptions(monkeypatch):
     monkeypatch.setattr(
-        mqtt_client, "deployment_status_report", MagicMock(side_effect=RuntimeError)
+        workerlink, "deployment_status_report", MagicMock(side_effect=RuntimeError)
     )
 
     _deployment_handler("n1", {"appname": "a"})  # must not raise
@@ -206,8 +196,8 @@ def test_deployment_handler_swallows_exceptions(monkeypatch):
 
 
 def test_undeployment_handler_is_noop():
-    # Still a TODO in production. Asserting the no-op means a real implementation
-    # shows up here as a deliberate change later.
+    # Still a TODO in production; pins the current no-op so a real
+    # implementation is a deliberate test change, not a silent one.
     assert _undeployment_handler("n1", {"appname": "a"}) is None
 
 
@@ -218,7 +208,8 @@ def test_undeployment_handler_is_noop():
 
 def test_address_handler_forwards_fields(monkeypatch):
     recorder = MagicMock()
-    monkeypatch.setattr(mqtt_client, "deployment_address_update", recorder)
+    monkeypatch.setattr(workerlink, "deployment_address_update", recorder)
+    monkeypatch.setattr(workerlink, "notify_service_change", MagicMock())
     payload = {
         "appname": "app.ns.svc.inst",
         "instance_number": 0,
@@ -235,7 +226,8 @@ def test_address_handler_forwards_fields(monkeypatch):
 
 def test_address_handler_missing_keys_become_none(monkeypatch):
     recorder = MagicMock()
-    monkeypatch.setattr(mqtt_client, "deployment_address_update", recorder)
+    monkeypatch.setattr(workerlink, "deployment_address_update", recorder)
+    monkeypatch.setattr(workerlink, "notify_service_change", MagicMock())
 
     _address_handler("n1", {})
 
@@ -244,10 +236,32 @@ def test_address_handler_missing_keys_become_none(monkeypatch):
 
 def test_address_handler_swallows_exceptions(monkeypatch):
     monkeypatch.setattr(
-        mqtt_client, "deployment_address_update", MagicMock(side_effect=RuntimeError)
+        workerlink, "deployment_address_update", MagicMock(side_effect=RuntimeError)
     )
 
     _address_handler("n1", {"appname": "a"})  # must not raise
+
+
+def test_address_handler_notifies_after_successful_update(monkeypatch):
+    monkeypatch.setattr(workerlink, "deployment_address_update", MagicMock())
+    notify = MagicMock()
+    monkeypatch.setattr(workerlink, "notify_service_change", notify)
+
+    _address_handler("n1", {"appname": "app.ns.svc.inst"})
+
+    notify.assert_called_once_with("app.ns.svc.inst", type="DEPLOYMENT")
+
+
+def test_address_handler_does_not_notify_when_update_raises(monkeypatch):
+    monkeypatch.setattr(
+        workerlink, "deployment_address_update", MagicMock(side_effect=RuntimeError)
+    )
+    notify = MagicMock()
+    monkeypatch.setattr(workerlink, "notify_service_change", notify)
+
+    _address_handler("n1", {"appname": "app.ns.svc.inst"})  # must not raise
+
+    notify.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -257,7 +271,7 @@ def test_address_handler_swallows_exceptions(monkeypatch):
 
 def test_interest_remove_handler_calls_remove_interest(monkeypatch):
     remove_interest = MagicMock()
-    monkeypatch.setattr(mqtt_client.interests, "remove_interest", remove_interest)
+    monkeypatch.setattr(workerlink.interests, "remove_interest", remove_interest)
 
     _interest_remove_handler("n1", {"appname": "app.ns.svc.inst"})
 
@@ -266,7 +280,7 @@ def test_interest_remove_handler_calls_remove_interest(monkeypatch):
 
 def test_interest_remove_handler_missing_appname_passes_none(monkeypatch):
     remove_interest = MagicMock()
-    monkeypatch.setattr(mqtt_client.interests, "remove_interest", remove_interest)
+    monkeypatch.setattr(workerlink.interests, "remove_interest", remove_interest)
 
     _interest_remove_handler("n1", {})
 
@@ -281,12 +295,12 @@ def test_interest_remove_handler_missing_appname_passes_none(monkeypatch):
 def test_tablequery_handler_sip_takes_precedence_over_sname(monkeypatch):
     add_interest = MagicMock()
     publish = MagicMock()
-    monkeypatch.setattr(mqtt_client.interests, "add_interest", add_interest)
-    monkeypatch.setattr(mqtt_client, "mqtt_publish_tablequery_result", publish)
+    monkeypatch.setattr(workerlink.interests, "add_interest", add_interest)
+    monkeypatch.setattr(workerlink, "publish_tablequery_result", publish)
     resolution_ip = MagicMock(return_value=("resolved.name", [], []))
     resolution_name = MagicMock()
-    monkeypatch.setattr(mqtt_client.resolution, "service_resolution_ip", resolution_ip)
-    monkeypatch.setattr(mqtt_client.resolution, "service_resolution", resolution_name)
+    monkeypatch.setattr(workerlink.resolution, "service_resolution_ip", resolution_ip)
+    monkeypatch.setattr(workerlink.resolution, "service_resolution", resolution_name)
 
     _tablequery_handler("n1", {"sname": "ignored.name", "sip": "10.30.0.1"})
 
@@ -304,10 +318,10 @@ def test_tablequery_handler_sip_takes_precedence_over_sname(monkeypatch):
 def test_tablequery_handler_resolution_exception_still_publishes(monkeypatch):
     add_interest = MagicMock()
     publish = MagicMock()
-    monkeypatch.setattr(mqtt_client.interests, "add_interest", add_interest)
-    monkeypatch.setattr(mqtt_client, "mqtt_publish_tablequery_result", publish)
+    monkeypatch.setattr(workerlink.interests, "add_interest", add_interest)
+    monkeypatch.setattr(workerlink, "publish_tablequery_result", publish)
     monkeypatch.setattr(
-        mqtt_client.resolution,
+        workerlink.resolution,
         "service_resolution_ip",
         MagicMock(side_effect=RuntimeError("db down")),
     )
@@ -328,13 +342,12 @@ def test_tablequery_handler_resolution_exception_still_publishes(monkeypatch):
 
 
 def test_tablequery_handler_both_missing_publishes_none_app_name(monkeypatch):
-    # Both keys absent (payload.get(...) -> None), not merely empty strings.
-    # An empty-string "sname" is falsy the same way but stays "" rather than
-    # becoming None, so the missing-key case is covered separately here.
+    # Both keys absent (payload.get(...) -> None), not merely empty strings -
+    # "" is falsy the same way but stays "" rather than becoming None.
     add_interest = MagicMock()
     publish = MagicMock()
-    monkeypatch.setattr(mqtt_client.interests, "add_interest", add_interest)
-    monkeypatch.setattr(mqtt_client, "mqtt_publish_tablequery_result", publish)
+    monkeypatch.setattr(workerlink.interests, "add_interest", add_interest)
+    monkeypatch.setattr(workerlink, "publish_tablequery_result", publish)
 
     _tablequery_handler("n1", {})
 
@@ -349,8 +362,8 @@ def test_tablequery_handler_both_empty_strings_publishes_empty_app_name(monkeypa
     # instead of becoming None.
     add_interest = MagicMock()
     publish = MagicMock()
-    monkeypatch.setattr(mqtt_client.interests, "add_interest", add_interest)
-    monkeypatch.setattr(mqtt_client, "mqtt_publish_tablequery_result", publish)
+    monkeypatch.setattr(workerlink.interests, "add_interest", add_interest)
+    monkeypatch.setattr(workerlink, "publish_tablequery_result", publish)
 
     _tablequery_handler("n1", {"sname": "", "sip": ""})
 
@@ -360,26 +373,26 @@ def test_tablequery_handler_both_empty_strings_publishes_empty_app_name(monkeypa
     )
 
 
-def test_tablequery_handler_publishes_to_result_topic(monkeypatch, mqtt_mock):
-    # Use the real mqtt_publish_tablequery_result here (not mocked) to check the
+def test_tablequery_handler_publishes_to_result_topic(monkeypatch, bus):
+    # Use the real publish_tablequery_result here (not mocked) to check the
     # exact wire topic.
-    monkeypatch.setattr(mqtt_client.interests, "add_interest", MagicMock())
+    monkeypatch.setattr(workerlink.interests, "add_interest", MagicMock())
     monkeypatch.setattr(
-        mqtt_client.resolution,
+        workerlink.resolution,
         "service_resolution",
         MagicMock(return_value=([], [])),
     )
 
     _tablequery_handler("n1", {"sname": "app.ns.svc.inst", "sip": ""})
 
-    topic, payload = mqtt_mock.publish.call_args.args
-    assert topic == "nodes/n1/net/tablequery/result"
-    assert json.loads(payload) == {
+    expected = {
         "app_name": "app.ns.svc.inst",
         "instance_list": [],
         "query_key": "app.ns.svc.inst",
     }
-    assert mqtt_mock.publish.call_args.kwargs == {"qos": 1}
+    assert bus.published[-1] == Message(
+        "nodes/n1/net/tablequery/result", json.dumps(expected).encode()
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -389,16 +402,16 @@ def test_tablequery_handler_publishes_to_result_topic(monkeypatch, mqtt_mock):
 
 def test_subnet_handler_get_success(monkeypatch):
     monkeypatch.setattr(
-        mqtt_client,
+        workerlink,
         "root_service_manager_get_subnet",
         MagicMock(return_value=["10.19.1.0", "fc00:1::"]),
     )
     mongo_update = MagicMock()
     monkeypatch.setattr(
-        mqtt_client, "mongo_find_node_by_id_and_update_subnetwork", mongo_update
+        workerlink, "mongo_find_node_by_id_and_update_subnetwork", mongo_update
     )
     publish = MagicMock()
-    monkeypatch.setattr(mqtt_client, "mqtt_publish_subnetwork_result", publish)
+    monkeypatch.setattr(workerlink, "publish_subnetwork_result", publish)
 
     _subnet_handler("n1", {"METHOD": "GET"})
 
@@ -410,14 +423,14 @@ def test_subnet_handler_get_success(monkeypatch):
 
 def test_subnet_handler_get_with_none_subnet_skips_mongo_and_publish(monkeypatch):
     monkeypatch.setattr(
-        mqtt_client, "root_service_manager_get_subnet", MagicMock(return_value=None)
+        workerlink, "root_service_manager_get_subnet", MagicMock(return_value=None)
     )
     mongo_update = MagicMock()
     publish = MagicMock()
     monkeypatch.setattr(
-        mqtt_client, "mongo_find_node_by_id_and_update_subnetwork", mongo_update
+        workerlink, "mongo_find_node_by_id_and_update_subnetwork", mongo_update
     )
-    monkeypatch.setattr(mqtt_client, "mqtt_publish_subnetwork_result", publish)
+    monkeypatch.setattr(workerlink, "publish_subnetwork_result", publish)
 
     _subnet_handler("n1", {"METHOD": "GET"})
 
@@ -427,7 +440,7 @@ def test_subnet_handler_get_with_none_subnet_skips_mongo_and_publish(monkeypatch
 
 def test_subnet_handler_get_exception_swallowed(monkeypatch):
     monkeypatch.setattr(
-        mqtt_client,
+        workerlink,
         "root_service_manager_get_subnet",
         MagicMock(side_effect=RuntimeError("boom")),
     )
@@ -437,7 +450,7 @@ def test_subnet_handler_get_exception_swallowed(monkeypatch):
 
 def test_subnet_handler_delete_is_noop(monkeypatch):
     get_subnet = MagicMock()
-    monkeypatch.setattr(mqtt_client, "root_service_manager_get_subnet", get_subnet)
+    monkeypatch.setattr(workerlink, "root_service_manager_get_subnet", get_subnet)
 
     _subnet_handler("n1", {"METHOD": "DELETE"})
 
@@ -446,7 +459,7 @@ def test_subnet_handler_delete_is_noop(monkeypatch):
 
 def test_subnet_handler_missing_method_is_noop(monkeypatch):
     get_subnet = MagicMock()
-    monkeypatch.setattr(mqtt_client, "root_service_manager_get_subnet", get_subnet)
+    monkeypatch.setattr(workerlink, "root_service_manager_get_subnet", get_subnet)
 
     _subnet_handler("n1", {})
 
@@ -458,52 +471,50 @@ def test_subnet_handler_missing_method_is_noop(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_mqtt_publish_tablequery_result(mqtt_mock):
+def test_publish_tablequery_result(bus):
     result = {"app_name": "a", "instance_list": [], "query_key": "a"}
 
-    mqtt_publish_tablequery_result("n1", result)
+    publish_tablequery_result("n1", result)
 
-    mqtt_mock.publish.assert_called_once_with(
-        "nodes/n1/net/tablequery/result", json.dumps(result), qos=1
+    assert bus.published[-1] == Message(
+        "nodes/n1/net/tablequery/result", json.dumps(result).encode()
     )
 
 
-def test_mqtt_publish_subnetwork_result(mqtt_mock):
+def test_publish_subnetwork_result(bus):
     result = {"address": "10.19.1.0", "addressv6": "fc00:1::"}
 
-    mqtt_publish_subnetwork_result("n1", result)
+    publish_subnetwork_result("n1", result)
 
-    mqtt_mock.publish.assert_called_once_with(
-        "nodes/n1/net/subnetwork/result", json.dumps(result), qos=1
+    assert bus.published[-1] == Message(
+        "nodes/n1/net/subnetwork/result", json.dumps(result).encode()
     )
 
 
-def test_mqtt_notify_service_change_default_type_is_null(mqtt_mock):
-    mqtt_notify_service_change("app.ns.svc.inst")
+def test_notify_service_change_default_type_is_null(bus):
+    notify_service_change("app.ns.svc.inst")
 
-    mqtt_mock.publish.assert_called_once_with(
-        "jobs/app.ns.svc.inst/updates_available", json.dumps({"type": None}), qos=1
+    assert bus.published[-1] == Message(
+        "jobs/app.ns.svc.inst/updates_available", json.dumps({"type": None}).encode()
     )
 
 
-def test_mqtt_notify_service_change_with_type(mqtt_mock):
-    mqtt_notify_service_change("app.ns.svc.inst", type="DEPLOYMENT")
+def test_notify_service_change_with_type(bus):
+    notify_service_change("app.ns.svc.inst", type="DEPLOYMENT")
 
-    mqtt_mock.publish.assert_called_once_with(
+    assert bus.published[-1] == Message(
         "jobs/app.ns.svc.inst/updates_available",
-        json.dumps({"type": "DEPLOYMENT"}),
-        qos=1,
+        json.dumps({"type": "DEPLOYMENT"}).encode(),
     )
 
 
-def test_mqtt_notify_service_change_job_name_can_be_an_ip(mqtt_mock):
+def test_notify_service_change_job_name_can_be_an_ip(bus):
     # `<job>` in jobs/<job>/updates_available may be a service IP string, not a
     # job name. The function has no notion of what a job name is, it just
     # interpolates whatever it's given.
-    mqtt_notify_service_change("10.30.0.1", type="UNDEPLOYMENT")
+    notify_service_change("10.30.0.1", type="UNDEPLOYMENT")
 
-    mqtt_mock.publish.assert_called_once_with(
+    assert bus.published[-1] == Message(
         "jobs/10.30.0.1/updates_available",
-        json.dumps({"type": "UNDEPLOYMENT"}),
-        qos=1,
+        json.dumps({"type": "UNDEPLOYMENT"}).encode(),
     )

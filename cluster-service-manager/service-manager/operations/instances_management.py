@@ -1,7 +1,7 @@
 from threading import Thread
 
 from interfaces.mongodb_requests import mongo_update_job_instance
-from interfaces import mqtt_client, root_service_manager_requests, mongodb_requests
+from interfaces import workerlink, root_service_manager_requests, mongodb_requests
 import traceback
 import copy
 import logging
@@ -57,4 +57,4 @@ def _update_cache_and_workers(job_name, instancenum, type):
             job_name=job_name, instance_number=instancenum
         )
 
-    mqtt_client.mqtt_notify_service_change(job_name=job_name, type=type)
+    workerlink.notify_service_change(job_name=job_name, type=type)

@@ -17,17 +17,27 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install pytest
-        working-directory: cluster-service-manager/service-manager
+      - name: Write Mosquitto config
         run: |
-          pip install pytest
+          cat > /tmp/mosquitto.conf <<'EOF'
+          listener 10003
+          allow_anonymous true
+          EOF
+
+      - name: Start Mosquitto broker
+        run: |
+          docker run -d --name mqtt -p 11883:10003 \
+            -v /tmp/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro \
+            eclipse-mosquitto:2.0
 
       - name: Install dependencies
         working-directory: cluster-service-manager/service-manager
         run: |
-          pip install -r requirements.txt
+          pip install -r requirements-test.txt
 
       - name: Run test suite
         working-directory: cluster-service-manager/service-manager
+        env:
+          OAKESTRA_TEST_MQTT_ADDR: 127.0.0.1:11883
         run: |
-           pytest
+           pytest -v

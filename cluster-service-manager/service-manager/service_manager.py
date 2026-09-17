@@ -4,7 +4,7 @@ import logging
 from flask import Flask, request
 from flask_socketio import SocketIO
 
-from interfaces.mqtt_client import mqtt_init
+from interfaces import workerlink
 from net_logging import configure_logging
 from interfaces.mongodb_requests import mongo_init
 from operations.instances_management import instance_updates
@@ -23,7 +23,9 @@ socketio = SocketIO(
 )
 app.config["LOGGING_FILTERS"] = ["flask.logging.threaded"]
 mongo_init(app)
-mqtt_init(app)
+bus = workerlink.bus_from_env()
+workerlink.start(bus)
+bus.connect()
 
 logger = logging.getLogger("cluster_service_manager")
 
