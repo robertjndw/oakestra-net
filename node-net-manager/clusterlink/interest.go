@@ -1,14 +1,15 @@
-package mqtt
+package clusterlink
 
 import (
 	"NetManager/events"
 	"NetManager/logger"
 	"NetManager/utils"
 	"encoding/json"
-	"github.com/eclipse/paho.mqtt.golang"
 	"log"
 	"sync"
 	"time"
+
+	messaging "github.com/oakestra/oakestra/libraries/oakestra_messaging_go"
 )
 
 var runningHandlers = utils.NewStringSlice()
@@ -23,7 +24,6 @@ type jobUpdatesTimer struct {
 	job          string
 	instance     int
 	topic        string
-	client       *NetMqttClient
 	env          jobEnvironmentManagerActions
 }
 
@@ -33,12 +33,12 @@ type jobEnvironmentManagerActions interface {
 	IsServiceDeployed(fullSnameAndInstance string) bool
 }
 
-type mqttInterestDeregisterRequest struct {
+type interestDeregisterRequest struct {
 	Appname string `json:"appname"`
 }
 
-func (jut *jobUpdatesTimer) MessageHandler(client mqtt.Client, message mqtt.Message) {
-	log.Printf("Received job update regarding %s", message.Topic())
+func (jut *jobUpdatesTimer) handle(msg messaging.Message) {
+	log.Printf("Received job update regarding %s", msg.Topic)
 	go jut.env.RefreshServiceTable(jut.job)
 }
 
@@ -60,7 +60,7 @@ func (jut *jobUpdatesTimer) startSelfDestructTimeout() {
 				//timeout ----> job no longer required. Let's clear the interest
 				log.Printf("De-registering from %s", jut.job)
 				cleanInterestTowardsJob(jut.job)
-				jut.client.DeRegisterTopic(jut.topic)
+				_ = getBus().Unsubscribe(jut.topic)
 				runningHandlersLock.Lock()
 				runningHandlers.RemoveElem(jut.job)
 				runningHandlersLock.Unlock()
@@ -73,11 +73,11 @@ func (jut *jobUpdatesTimer) startSelfDestructTimeout() {
 	}
 }
 
-// MqttRegisterInterest :
+// RegisterInterest :
 /* Register an interest in a route for 5 minutes.
 If the route is not used for more than 5 minutes the interest is removed
 If the instance number is provided, the interest is kept until that instance is deployed in the node */
-func MqttRegisterInterest(jobName string, env jobEnvironmentManagerActions, instance ...int) {
+func RegisterInterest(jobName string, env jobEnvironmentManagerActions, instance ...int) {
 
 	runningHandlersLock.Lock()
 	defer runningHandlersLock.Unlock()
@@ -95,18 +95,17 @@ func MqttRegisterInterest(jobName string, env jobEnvironmentManagerActions, inst
 		eventManager: events.GetInstance(),
 		job:          jobName,
 		env:          env,
-		client:       GetNetMqttClient(),
 		instance:     instanceNumber,
 	}
 
 	jobTimer.topic = "jobs/" + jobName + "/updates_available"
-	GetNetMqttClient().RegisterTopic(jobTimer.topic, jobTimer.MessageHandler)
-	log.Printf("MQTT - Subscribed to %s ", jobTimer.topic)
+	_ = getBus().Subscribe(jobTimer.topic, jobTimer.handle)
+	log.Printf("Subscribed to %s ", jobTimer.topic)
 	runningHandlers.Add(jobTimer.job)
 	go jobTimer.startSelfDestructTimeout()
 }
 
-func MqttIsInterestRegistered(jobName string) bool {
+func IsInterestRegistered(jobName string) bool {
 	runningHandlersLock.RLock()
 	defer runningHandlersLock.RUnlock()
 	if runningHandlers.Exists(jobName) {
@@ -116,7 +115,7 @@ func MqttIsInterestRegistered(jobName string) bool {
 }
 
 func cleanInterestTowardsJob(jobName string) {
-	request := mqttInterestDeregisterRequest{Appname: jobName}
+	request := interestDeregisterRequest{Appname: jobName}
 	jsonreq, _ := json.Marshal(request)
-	_ = GetNetMqttClient().PublishToBroker("interest/remove", string(jsonreq))
+	_ = publish("interest/remove", string(jsonreq))
 }

@@ -2,10 +2,10 @@ package env
 
 import (
 	"NetManager/TableEntryCache"
+	"NetManager/clusterlink"
 	"NetManager/events"
 	"NetManager/logger"
 	"NetManager/model"
-	"NetManager/mqtt"
 	"NetManager/network"
 	"errors"
 	"fmt"
@@ -140,7 +140,7 @@ func NewCustom(proxyname string, customConfig Configuration) *Environment {
 // NewEnvironmentClusterConfigured Creates a new environment using the default configuration and asking the cluster for a new subnetwork
 func NewEnvironmentClusterConfigured(proxyname string) *Environment {
 	logger.InfoLogger().Println("Asking the cluster for a new subnetwork")
-	subnetwork_response, err := mqtt.RequestSubnetworkMqttBlocking()
+	subnetwork_response, err := clusterlink.RequestSubnetworkBlocking()
 	if err != nil {
 		log.Fatal("Invalid subnetwork received. Can't proceed.")
 	}
@@ -488,12 +488,12 @@ func (env *Environment) GetTableEntryByServiceIP(ip net.IP) []TableEntryCache.Ta
 	if err == nil {
 		var once sync.Once
 		for _, tableEntry := range entryList {
-			once.Do(func() { mqtt.MqttRegisterInterest(tableEntry.JobName, env) })
+			once.Do(func() { clusterlink.RegisterInterest(tableEntry.JobName, env) })
 			env.AddTableQueryEntry(tableEntry)
 		}
 		table = env.translationTable.SearchByServiceIP(ip)
 		// register interest for sip as well to avoid querying the address too many times
-		mqtt.MqttRegisterInterest(ip.String(), env)
+		clusterlink.RegisterInterest(ip.String(), env)
 	}
 
 	return table

@@ -1,4 +1,4 @@
-package mqtt
+package clusterlink
 
 import (
 	"NetManager/logger"
@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
+	messaging "github.com/oakestra/oakestra/libraries/oakestra_messaging_go"
 )
 
 /*---- Singleton cache instance  ----*/
@@ -24,8 +24,8 @@ var (
 // 10 seconds, but 5 seconds is what the select actually waits.
 var tableQueryTimeout = 5 * time.Second
 
-/*----- Mqtt Table query cache classes and interfaces -----*/
-type TablequeryMqttInterface interface {
+/*----- Table query cache classes and interfaces -----*/
+type TableQuerier interface {
 	TableQueryByIpRequestBlocking(sip string, force_optional ...bool) (TableQueryResponse, error)
 	TableQueryByJobNameRequestBlocking(sname string, force_optional ...bool) (TableQueryResponse, error)
 }
@@ -37,7 +37,7 @@ type TableQueryRequestCache struct {
 
 /*---------------------------------------------------------*/
 
-/*------------------- Mqtt responses and requests ----------------------*/
+/*------------------- Responses and requests ----------------------*/
 type TableQueryResponse struct {
 	JobName      string            `json:"app_name"`
 	InstanceList []ServiceInstance `json:"instance_list"`
@@ -95,14 +95,14 @@ func (cache *TableQueryRequestCache) tableQueryRequestBlocking(sip string, sname
 	}
 
 	// If the worker node already registered an interest towards this route, avoid new requests.
-	if MqttIsInterestRegistered(reqname) && !force {
+	if IsInterestRegistered(reqname) && !force {
 		return TableQueryResponse{}, errors.New("interest already registered")
 	}
 
 	responseChannel := make(chan TableQueryResponse, 10)
 	var updatedRequests []chan TableQueryResponse
 
-	//appending response channel used by the Mqtt handler
+	//appending response channel used by the result handler
 	cache.requestadd.Lock()
 	siprequests := cache.siprequests[reqname]
 	if siprequests != nil {
@@ -114,14 +114,14 @@ func (cache *TableQueryRequestCache) tableQueryRequestBlocking(sip string, sname
 	cache.siprequests[reqname] = &updatedRequests
 	cache.requestadd.Unlock()
 
-	//publishing mqtt message
+	//publishing the request
 	jsonreq, _ := json.Marshal(tableQueryRequest{
 		Sname: sname,
 		Sip:   sip,
 	})
-	_ = GetNetMqttClient().PublishToBroker("tablequery/request", string(jsonreq))
+	_ = publish("tablequery/request", string(jsonreq))
 
-	//waiting for maximum 5 seconds the mqtt handler to receive a response. Otherwise fail the tableQuery.
+	//waiting for maximum 5 seconds for a response. Otherwise fail the tableQuery.
 	log.Printf("waiting for table query %s", reqname)
 	select {
 	case result := <-responseChannel:
@@ -150,15 +150,14 @@ func (cache *TableQueryRequestCache) TableQueryByJobNameRequestBlocking(jobname 
 }
 
 /*
-Handler used by the mqtt client to dispatch the table query result
+Handler used to dispatch the table query result
 */
-func (cache *TableQueryRequestCache) TablequeryResultMqttHandler(client mqtt.Client, msg mqtt.Message) {
-	log.Printf("MQTT - Received mqtt table query message: %s", msg.Payload())
+func (cache *TableQueryRequestCache) handleTableQueryResult(msg messaging.Message) {
+	log.Printf("MQTT - Received mqtt table query message: %s", msg.Payload)
 
 	//response parsing
-	payload := msg.Payload()
 	var responseStruct TableQueryResponse
-	err := json.Unmarshal(payload, &responseStruct)
+	err := json.Unmarshal(msg.Payload, &responseStruct)
 	if err != nil {
 		log.Println(err)
 	}

@@ -25,9 +25,9 @@ The Network manager is divided in 4 main components:
 ├── proxy/
 │			Description:
 │				This is where the ProxyTunnel implmentation belongs
-├── mqtt/
+├── clusterlink/
 │			Description:
-│				Mqtt client implementation for cluster service manager routes resolution and subnetwork management.
+│				NetManager's link to the cluster, used for routes resolution and subnetwork management. Built on the shared oakestra_messaging_go library rather than talking to paho directly.
 ├── cmd/
 │			Description:
 │				CLI commands

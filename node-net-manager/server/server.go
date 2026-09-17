@@ -1,11 +1,11 @@
 package server
 
 import (
+	"NetManager/clusterlink"
 	"NetManager/env"
 	"NetManager/handlers"
 	"NetManager/logger"
 	"NetManager/model"
-	"NetManager/mqtt"
 	"NetManager/network"
 	"NetManager/proxy"
 	"encoding/json"
@@ -16,6 +16,9 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	messaging "github.com/oakestra/oakestra/libraries/oakestra_messaging_go"
+	mqttbus "github.com/oakestra/oakestra/libraries/oakestra_messaging_go/mqtt"
 
 	"github.com/gorilla/mux"
 )
@@ -46,7 +49,7 @@ func update() {
 			// update service in the cluster
 			//for each service instance in the worker, update the public address
 			for _, si := range Env.GetTableEntriesOnNode() {
-				err := mqtt.NotifyAddressChange(si.Appname, si.Instancenumber, defaultLink.String(), model.NetConfig.NodePublicPort)
+				err := clusterlink.NotifyAddressChange(si.Appname, si.Instancenumber, defaultLink.String(), model.NetConfig.NodePublicPort)
 				if err != nil {
 					logger.ErrorLogger().Println("[ERROR]:", err)
 				}
@@ -139,8 +142,34 @@ func register(writer http.ResponseWriter, request *http.Request) {
 		model.NetConfig.ClusterMqttPort,
 	)
 
-	// initialize mqtt connection to the broker
-	mqtt.InitNetMqttClient(requestStruct.ClientID, model.NetConfig.ClusterUrl, model.NetConfig.ClusterMqttPort, model.NetConfig.MqttCert, model.NetConfig.MqttKey)
+	// initialize the connection to the cluster message bus
+	if _, err := messaging.BackendFromEnv(); err != nil {
+		logger.ErrorLogger().Printf("clusterlink: %v", err)
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	bus, err := mqttbus.NewBus(mqttbus.Config{
+		BrokerURL:   model.NetConfig.ClusterUrl,
+		BrokerPort:  model.NetConfig.ClusterMqttPort,
+		ClientID:    requestStruct.ClientID,
+		CertFile:    model.NetConfig.MqttCert,
+		KeyFile:     model.NetConfig.MqttKey,
+		QoS:         1,
+		Logger:      logger.InfoLogger(),
+		ErrorLogger: logger.ErrorLogger(),
+	})
+	if err != nil {
+		logger.ErrorLogger().Printf("clusterlink: building the message bus: %v", err)
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if err := clusterlink.Init(bus, requestStruct.ClientID); err != nil {
+		logger.ErrorLogger().Printf("clusterlink: connecting to the cluster: %v", err)
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
 	// initialize the proxy tunnel
 	Proxy = proxy.New()

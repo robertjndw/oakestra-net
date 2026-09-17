@@ -7,6 +7,7 @@ require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/google/gopacket v1.1.19
 	github.com/gorilla/mux v1.8.1
+	github.com/oakestra/oakestra/libraries/oakestra_messaging_go v0.0.0
 	github.com/sipcapture/heplify v1.66.7
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 	github.com/spf13/cobra v1.8.1
@@ -15,6 +16,10 @@ require (
 	github.com/vishvananda/netns v0.0.4
 	gotest.tools v2.2.0+incompatible
 )
+
+// Temporary: branch isn't pushed yet, so no pseudo-version to resolve. Drop
+// once it lands, then: go get .../oakestra_messaging_go@feat/add-pub-sub-interface
+replace github.com/oakestra/oakestra/libraries/oakestra_messaging_go => ../../oakestra.worktrees/feat-add-mqtt-tests/libraries/oakestra_messaging_go
 
 require (
 	github.com/ghodss/yaml v1.0.0 // indirect

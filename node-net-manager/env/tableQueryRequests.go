@@ -2,7 +2,7 @@ package env
 
 import (
 	"NetManager/TableEntryCache"
-	mqttifce "NetManager/mqtt"
+	"NetManager/clusterlink"
 	"errors"
 	"log"
 	"net"
@@ -10,13 +10,13 @@ import (
 )
 
 /*
-Asks the MQTT client for a table query and parses the result
+Asks the cluster for a table query and parses the result
 */
 func tableQueryByIP(ip net.IP, force_optional ...bool) ([]TableEntryCache.TableEntry, error) {
 	log.Println("[MQTT TABLE QUERY] sip:", ip.String())
-	var mqttTablequery mqttifce.TablequeryMqttInterface = mqttifce.GetTableQueryRequestCacheInstance()
+	var tablequery clusterlink.TableQuerier = clusterlink.GetTableQueryRequestCacheInstance()
 
-	responseStruct, err := mqttTablequery.TableQueryByIpRequestBlocking(ip.String(), force_optional...)
+	responseStruct, err := tablequery.TableQueryByIpRequestBlocking(ip.String(), force_optional...)
 	if err != nil {
 		return nil, err
 	}
@@ -25,14 +25,14 @@ func tableQueryByIP(ip net.IP, force_optional ...bool) ([]TableEntryCache.TableE
 }
 
 /*
-Asks the MQTT client for a table query and parses the result
+Asks the cluster for a table query and parses the result
 */
 func tableQueryByJobName(jobname string, force_optional ...bool) ([]TableEntryCache.TableEntry, error) {
 
 	log.Println("[MQTT TABLE QUERY] sname:", jobname)
-	var mqttTablequery mqttifce.TablequeryMqttInterface = mqttifce.GetTableQueryRequestCacheInstance()
+	var tablequery clusterlink.TableQuerier = clusterlink.GetTableQueryRequestCacheInstance()
 
-	responseStruct, err := mqttTablequery.TableQueryByJobNameRequestBlocking(jobname, force_optional...)
+	responseStruct, err := tablequery.TableQueryByJobNameRequestBlocking(jobname, force_optional...)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +40,7 @@ func tableQueryByJobName(jobname string, force_optional ...bool) ([]TableEntryCa
 	return responseParser(responseStruct)
 }
 
-func responseParser(responseStruct mqttifce.TableQueryResponse) ([]TableEntryCache.TableEntry, error) {
+func responseParser(responseStruct clusterlink.TableQueryResponse) ([]TableEntryCache.TableEntry, error) {
 	appCompleteName := strings.Split(responseStruct.JobName, ".")
 
 	if len(appCompleteName) != 4 {

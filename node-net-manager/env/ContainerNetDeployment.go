@@ -1,8 +1,8 @@
 package env
 
 import (
+	"NetManager/clusterlink"
 	"NetManager/logger"
-	"NetManager/mqtt"
 	"NetManager/network"
 	"fmt"
 	"net"
@@ -174,7 +174,7 @@ func (env *Environment) DetachContainer(sname string, instance int) {
 		_ = network.ManageContainerPorts(s.ipv6, s.portmapping, network.ClosePorts)
 		_ = netlink.LinkDel(s.veth)
 		// if no interest registered delete all remaining info about the service
-		if !mqtt.MqttIsInterestRegistered(sname) {
+		if !clusterlink.IsInterestRegistered(sname) {
 			env.RemoveServiceEntries(sname)
 		}
 	}

@@ -1,4 +1,4 @@
-package mqtt
+package clusterlink
 
 import (
 	"encoding/json"
@@ -10,15 +10,15 @@ import (
 	"testing"
 	"time"
 
+	mqttbus "github.com/oakestra/oakestra/libraries/oakestra_messaging_go/mqtt"
+
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"gotest.tools/assert"
 )
 
 // brokerFromEnv returns the host/port of a real broker to test against, or
-// skips the test if OAKESTRA_TEST_MQTT_ADDR isn't set. Nothing in this file is
-// Mosquitto-specific: any MQTT 3.1.1 broker reachable at that address works,
-// which is what lets step 3 of the NATS migration re-point this at NATS's MQTT
-// compatibility mode without touching the tests themselves.
+// skips the test if OAKESTRA_TEST_MQTT_ADDR isn't set. Nothing here is
+// Mosquitto-specific - any MQTT 3.1.1 broker reachable at that address works.
 func brokerFromEnv(t *testing.T) (host, port string) {
 	t.Helper()
 	addr := os.Getenv("OAKESTRA_TEST_MQTT_ADDR")
@@ -41,7 +41,8 @@ type receivedMsg struct {
 
 // integrationPeer is a real paho client standing in for the cluster service
 // manager: subscribed to the node's whole net/ namespace, and able to publish
-// results and job update notifications back.
+// results and job update notifications back. It talks paho directly because
+// it plays the broker-side peer, not the code under test.
 type integrationPeer struct {
 	client mqtt.Client
 
@@ -118,122 +119,36 @@ func (p *integrationPeer) expect(t *testing.T, topic string, timeout time.Durati
 	}
 }
 
-// instrumentedToken wraps a real paho Token and closes settled the moment
-// Wait/WaitTimeout is actually invoked on it - i.e. once whatever production
-// code called Publish has moved past that call in its own program order. See
-// instrumentedClient for why this matters.
-type instrumentedToken struct {
-	mqtt.Token
-	settled chan struct{}
-	once    sync.Once
-}
-
-func wrapToken(inner mqtt.Token) *instrumentedToken {
-	return &instrumentedToken{Token: inner, settled: make(chan struct{})}
-}
-
-func (t *instrumentedToken) markSettled() { t.once.Do(func() { close(t.settled) }) }
-func (t *instrumentedToken) Wait() bool {
-	r := t.Token.Wait()
-	t.markSettled()
-	return r
-}
-func (t *instrumentedToken) WaitTimeout(d time.Duration) bool {
-	r := t.Token.WaitTimeout(d)
-	t.markSettled()
-	return r
-}
-
-// instrumentedClient wraps the real paho client so tests can wait for a
-// Publish call to fully finish, including whatever the caller does with the
-// token afterwards (PublishToBroker calls Unlock() then WaitTimeout() right
-// after Publish() returns). RequestSubnetworkMqttBlocking fires its publish
-// from a goroutine it never joins; without this, a test can observe its own
-// expected result on the wire and return while that goroutine is still mid
-// flight, racing the next test's resetForTest against netMqttClient's fields.
-type instrumentedClient struct {
-	mqtt.Client
-
-	mu     sync.Mutex
-	tokens []*instrumentedToken
-}
-
-func (c *instrumentedClient) Publish(topic string, qos byte, retained bool, payload interface{}) mqtt.Token {
-	tok := wrapToken(c.Client.Publish(topic, qos, retained, payload))
-	c.mu.Lock()
-	c.tokens = append(c.tokens, tok)
-	c.mu.Unlock()
-	return tok
-}
-
-// awaitPublishesSettled blocks until every Publish call issued so far has
-// settled (see instrumentedToken), i.e. until PublishToBroker has nothing
-// left to do with any of them.
-func (c *instrumentedClient) awaitPublishesSettled(t *testing.T, timeout time.Duration) {
-	t.Helper()
-	c.mu.Lock()
-	tokens := append([]*instrumentedToken{}, c.tokens...)
-	c.mu.Unlock()
-	for _, tok := range tokens {
-		select {
-		case <-tok.settled:
-		case <-time.After(timeout):
-			t.Fatal("timed out waiting for a publish to settle")
-		}
-	}
-}
-
-// startNetManagerClient brings up a real NetManager mqtt client against the
-// broker under test, wrapping newClient to chain onto the real OnConnect
-// handler so the caller knows the default subscriptions (tablequery/result,
-// subnetwork/result) are live before it proceeds. The returned client lets
-// tests wait out fire-and-forget publishes before finishing (see
-// instrumentedClient).
-func startNetManagerClient(t *testing.T, host, port, nodeID string) *instrumentedClient {
+// startClusterlink brings up a real mqtt bus against the broker under test
+// and wires it through Init. Init's Connect blocks until the broker has acked
+// the initial subscriptions (tablequery/result, subnetwork/result), so there's
+// no separate "ready" signal to wait for.
+func startClusterlink(t *testing.T, host, port, nodeID string) *mqttbus.Bus {
 	t.Helper()
 	resetForTest(t)
 
-	ready := make(chan struct{})
-	var instrumented *instrumentedClient
-	newClient = func(opts *mqtt.ClientOptions) mqtt.Client {
-		userOnConnect := opts.OnConnect
-		opts.OnConnect = func(c mqtt.Client) {
-			if userOnConnect != nil {
-				userOnConnect(c)
-			}
-			close(ready)
-		}
-		instrumented = &instrumentedClient{Client: mqtt.NewClient(opts)}
-		return instrumented
+	bus, err := mqttbus.NewBus(mqttbus.Config{
+		BrokerURL:  host,
+		BrokerPort: port,
+		ClientID:   nodeID,
+		QoS:        1,
+	})
+	if err != nil {
+		t.Fatalf("building the mqtt bus: %v", err)
 	}
-
-	InitNetMqttClient(nodeID, host, port, "", "")
-
-	select {
-	case <-ready:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the NetManager mqtt client to connect and subscribe")
+	if err := Init(bus, nodeID); err != nil {
+		t.Fatalf("Init: %v", err)
 	}
-	return instrumented
-}
-
-func TestIntegration_ConnectsWithExactClientID(t *testing.T) {
-	host, port := brokerFromEnv(t)
-	nodeID := fmt.Sprintf("it-%d", time.Now().UnixNano())
-	startNetManagerClient(t, host, port, nodeID)
-
-	client := netMqttClient.mainMqttClient
-	if !client.IsConnected() {
-		t.Fatal("expected the client to be connected")
-	}
-	reader := client.OptionsReader()
-	assert.Equal(t, reader.ClientID(), nodeID)
+	t.Cleanup(func() {
+		_ = bus.Close()
+	})
+	return bus
 }
 
 func TestIntegration_TableQuery_RoundTrip(t *testing.T) {
 	host, port := brokerFromEnv(t)
 	nodeID := fmt.Sprintf("it-%d", time.Now().UnixNano())
-	startNetManagerClient(t, host, port, nodeID)
+	startClusterlink(t, host, port, nodeID)
 	peer := newPeer(t, host, port, nodeID)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = 5 * time.Second
@@ -264,12 +179,11 @@ func TestIntegration_TableQuery_RoundTrip(t *testing.T) {
 	assert.NilError(t, json.Unmarshal(fixture, &want))
 	assert.DeepEqual(t, resp, want)
 
-	// TablequeryResultMqttHandler keeps running after it releases our specific
-	// waiter: it still walks the fixture's other query keys (app_name, the
-	// other service_ip addresses), touching the shared cache. Poll for all of
-	// them to show up (mapped to nil, since nothing else is waiting on them)
-	// before the next test resets that cache out from under it - a fixed sleep
-	// isn't reliable here under heavy scheduler/log contention.
+	// handleTableQueryResult keeps walking the fixture's other query keys
+	// after releasing our waiter, touching the shared cache. Poll until they
+	// all show up (nil, nothing else is waiting on them) before the next
+	// test resets that cache - a fixed sleep isn't reliable under heavy
+	// scheduler/log contention.
 	otherKeys := []string{"app.ns.svc.inst", "10.30.0.1", "fdff:1000::1", "10.30.1.1", "fdff:1001::1"}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -286,7 +200,7 @@ func TestIntegration_TableQuery_RoundTrip(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for TablequeryResultMqttHandler to finish walking all query keys")
+			t.Fatal("timed out waiting for handleTableQueryResult to finish walking all query keys")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -295,7 +209,7 @@ func TestIntegration_TableQuery_RoundTrip(t *testing.T) {
 func TestIntegration_TableQuery_TimeoutOnTheWire(t *testing.T) {
 	host, port := brokerFromEnv(t)
 	nodeID := fmt.Sprintf("it-%d", time.Now().UnixNano())
-	startNetManagerClient(t, host, port, nodeID)
+	startClusterlink(t, host, port, nodeID)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = 300 * time.Millisecond
 
@@ -309,15 +223,15 @@ func TestIntegration_TableQuery_TimeoutOnTheWire(t *testing.T) {
 func TestIntegration_Subnet_RoundTrip(t *testing.T) {
 	host, port := brokerFromEnv(t)
 	nodeID := fmt.Sprintf("it-%d", time.Now().UnixNano())
-	client := startNetManagerClient(t, host, port, nodeID)
+	startClusterlink(t, host, port, nodeID)
 	peer := newPeer(t, host, port, nodeID)
 	subnetworkTimeout = 5 * time.Second
 
 	done := make(chan struct{})
-	var resp mqttSubnetworkResponse
+	var resp SubnetworkResponse
 	var rerr error
 	go func() {
-		resp, rerr = RequestSubnetworkMqttBlocking()
+		resp, rerr = RequestSubnetworkBlocking()
 		close(done)
 	}()
 
@@ -334,21 +248,15 @@ func TestIntegration_Subnet_RoundTrip(t *testing.T) {
 		t.Fatal("timed out waiting for the subnet request to resolve")
 	}
 	assert.NilError(t, rerr)
-	var want mqttSubnetworkResponse
+	var want SubnetworkResponse
 	assert.NilError(t, json.Unmarshal(fixture, &want))
 	assert.DeepEqual(t, resp, want)
-
-	// RequestSubnetworkMqttBlocking publishes its request from a detached
-	// goroutine it never joins; wait for that publish to fully settle (see
-	// instrumentedClient) before the next test resets the shared client state
-	// out from under it.
-	client.awaitPublishesSettled(t, 5*time.Second)
 }
 
 func TestIntegration_NotifyDeploymentStatus_OnTheWire(t *testing.T) {
 	host, port := brokerFromEnv(t)
 	nodeID := fmt.Sprintf("it-%d", time.Now().UnixNano())
-	startNetManagerClient(t, host, port, nodeID)
+	startClusterlink(t, host, port, nodeID)
 	peer := newPeer(t, host, port, nodeID)
 
 	err := NotifyDeploymentStatus("app.ns.svc.inst", "DEPLOYED", 0, "10.19.1.2", "fc00::2", "192.168.1.10", "50103")
@@ -362,7 +270,7 @@ func TestIntegration_NotifyDeploymentStatus_OnTheWire(t *testing.T) {
 func TestIntegration_NotifyAddressChange_OnTheWire(t *testing.T) {
 	host, port := brokerFromEnv(t)
 	nodeID := fmt.Sprintf("it-%d", time.Now().UnixNano())
-	startNetManagerClient(t, host, port, nodeID)
+	startClusterlink(t, host, port, nodeID)
 	peer := newPeer(t, host, port, nodeID)
 
 	err := NotifyAddressChange("app.ns.svc.inst", 0, "192.168.1.11", "50103")
@@ -376,16 +284,16 @@ func TestIntegration_NotifyAddressChange_OnTheWire(t *testing.T) {
 func TestIntegration_InterestRegister_UpdatesAvailableTriggersRefresh(t *testing.T) {
 	host, port := brokerFromEnv(t)
 	nodeID := fmt.Sprintf("it-%d", time.Now().UnixNano())
-	startNetManagerClient(t, host, port, nodeID)
+	startClusterlink(t, host, port, nodeID)
 	peer := newPeer(t, host, port, nodeID)
 	selfDestructTimeout = 3 * time.Second
 
 	job := fmt.Sprintf("it-job-%d", time.Now().UnixNano())
 	env := newFakeEnv()
 
-	MqttRegisterInterest(job, env)
-	// RegisterTopic's Subscribe token.WaitTimeout only waits for the SUBACK;
-	// give the broker a beat to actually start routing before we publish.
+	RegisterInterest(job, env)
+	// Subscribe returns once the broker acks the SUBACK; give it a beat to
+	// actually start routing before we publish.
 	time.Sleep(200 * time.Millisecond)
 
 	peer.publish(t, fmt.Sprintf("jobs/%s/updates_available", job), 1, loadContract(t, "updates_available.json"))
@@ -408,7 +316,7 @@ func TestIntegration_InterestRegister_UpdatesAvailableTriggersRefresh(t *testing
 func TestIntegration_SelfDestruct_PublishesInterestRemoveOnWireAndStopsRefresh(t *testing.T) {
 	host, port := brokerFromEnv(t)
 	nodeID := fmt.Sprintf("it-%d", time.Now().UnixNano())
-	startNetManagerClient(t, host, port, nodeID)
+	startClusterlink(t, host, port, nodeID)
 	peer := newPeer(t, host, port, nodeID)
 	selfDestructTimeout = 300 * time.Millisecond
 
@@ -416,7 +324,7 @@ func TestIntegration_SelfDestruct_PublishesInterestRemoveOnWireAndStopsRefresh(t
 	env := newFakeEnv()
 	env.setDeployed(job, false)
 
-	MqttRegisterInterest(job, env)
+	RegisterInterest(job, env)
 
 	msg := peer.expect(t, fmt.Sprintf("nodes/%s/net/interest/remove", nodeID), 5*time.Second)
 	assert.Equal(t, msg.qos, byte(1))
@@ -429,7 +337,7 @@ func TestIntegration_SelfDestruct_PublishesInterestRemoveOnWireAndStopsRefresh(t
 	waitForInterestCleared(t, job, 5*time.Second)
 
 	// The topic was unsubscribed both at the broker and in the dispatcher's
-	// topic map: a further updates_available publish must not trigger a refresh.
+	// registry: a further updates_available publish must not trigger a refresh.
 	peer.publish(t, fmt.Sprintf("jobs/%s/updates_available", job), 1, loadContract(t, "updates_available.json"))
 	time.Sleep(300 * time.Millisecond)
 	if len(env.Refreshed()) != 0 {

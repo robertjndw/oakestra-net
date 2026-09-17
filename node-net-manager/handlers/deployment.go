@@ -1,10 +1,10 @@
 package handlers
 
 import (
+	"NetManager/clusterlink"
 	"NetManager/env"
 	"NetManager/logger"
 	"NetManager/model"
-	"NetManager/mqtt"
 	"fmt"
 	"net"
 	"net/http"
@@ -95,7 +95,7 @@ func deploymentHandler(requestStruct *ContainerDeployTask) (net.IP, net.IP, erro
 	}
 
 	// notify to net-component
-	err = mqtt.NotifyDeploymentStatus(
+	err = clusterlink.NotifyDeploymentStatus(
 		requestStruct.ServiceName,
 		"DEPLOYED",
 		requestStruct.Instancenumber,
@@ -115,8 +115,8 @@ func deploymentHandler(requestStruct *ContainerDeployTask) (net.IP, net.IP, erro
 func updateInternalProxyDataStructures(requestStruct *ContainerDeployTask) {
 	// Update internal table entry if an interest has not been set already.
 	// Otherwise, do nothing, the net will autonomously update.
-	if !mqtt.MqttIsInterestRegistered(requestStruct.ServiceName) {
+	if !clusterlink.IsInterestRegistered(requestStruct.ServiceName) {
 		requestStruct.Env.RefreshServiceTable(requestStruct.ServiceName)
-		mqtt.MqttRegisterInterest(requestStruct.ServiceName, requestStruct.Env, requestStruct.Instancenumber)
+		clusterlink.RegisterInterest(requestStruct.ServiceName, requestStruct.Env, requestStruct.Instancenumber)
 	}
 }

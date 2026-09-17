@@ -1,4 +1,4 @@
-package mqtt
+package clusterlink
 
 import (
 	"encoding/json"
@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	messaging "github.com/oakestra/oakestra/libraries/oakestra_messaging_go"
+	"github.com/oakestra/oakestra/libraries/oakestra_messaging_go/memory"
 	"gotest.tools/assert"
 )
 
@@ -32,9 +34,7 @@ func waitForPendingQuery(t *testing.T, cache *TableQueryRequestCache, key string
 
 func TestTableQueryBySip_PublishesRequestContract(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
-	fc := netMqttClient.mainMqttClient.(*fakeClient)
+	bus := installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = 200 * time.Millisecond
 
@@ -44,9 +44,8 @@ func TestTableQueryBySip_PublishesRequestContract(t *testing.T) {
 		close(done)
 	}()
 
-	call := awaitPublish(t, fc, "nodes/node1/net/tablequery/request", time.Second)
-	assertJSONEqual(t, loadContract(t, "tablequery_request_by_sip.json"), []byte(call.payload))
-	assert.Equal(t, call.qos, byte(1))
+	msg := awaitPublish(t, bus, "nodes/node1/net/tablequery/request", time.Second)
+	assertJSONEqual(t, loadContract(t, "tablequery_request_by_sip.json"), msg.Payload)
 
 	select {
 	case <-done:
@@ -57,9 +56,7 @@ func TestTableQueryBySip_PublishesRequestContract(t *testing.T) {
 
 func TestTableQueryByName_PublishesRequestContract(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
-	fc := netMqttClient.mainMqttClient.(*fakeClient)
+	bus := installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = 200 * time.Millisecond
 
@@ -69,9 +66,8 @@ func TestTableQueryByName_PublishesRequestContract(t *testing.T) {
 		close(done)
 	}()
 
-	call := awaitPublish(t, fc, "nodes/node1/net/tablequery/request", time.Second)
-	assertJSONEqual(t, loadContract(t, "tablequery_request_by_name.json"), []byte(call.payload))
-	assert.Equal(t, call.qos, byte(1))
+	msg := awaitPublish(t, bus, "nodes/node1/net/tablequery/request", time.Second)
+	assertJSONEqual(t, loadContract(t, "tablequery_request_by_name.json"), msg.Payload)
 
 	select {
 	case <-done:
@@ -81,9 +77,9 @@ func TestTableQueryByName_PublishesRequestContract(t *testing.T) {
 }
 
 // deliverResult starts a blocking table query for reqname in the background,
-// waits for it to register, feeds the fixture through the result handler and
-// returns what the query resolved to.
-func deliverResult(t *testing.T, cache *TableQueryRequestCache, reqname string, query func() (TableQueryResponse, error), fixture []byte) (TableQueryResponse, error) {
+// waits for it to register, feeds the fixture through the bus (exercising the
+// same subscription Init registered) and returns what the query resolved to.
+func deliverResult(t *testing.T, bus *memory.Bus, cache *TableQueryRequestCache, reqname string, query func() (TableQueryResponse, error), fixture []byte) (TableQueryResponse, error) {
 	t.Helper()
 
 	resultCh := make(chan TableQueryResponse, 1)
@@ -95,7 +91,7 @@ func deliverResult(t *testing.T, cache *TableQueryRequestCache, reqname string, 
 	}()
 
 	waitForPendingQuery(t, cache, reqname, time.Second)
-	cache.TablequeryResultMqttHandler(netMqttClient.mainMqttClient, &fakeMessage{payload: fixture})
+	bus.Deliver("nodes/node1/net/tablequery/result", fixture)
 
 	select {
 	case err := <-errCh:
@@ -108,8 +104,7 @@ func deliverResult(t *testing.T, cache *TableQueryRequestCache, reqname string, 
 
 func TestTableQuery_ResolvedByQueryKey(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
+	bus := installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = time.Second
 
@@ -117,11 +112,10 @@ func TestTableQuery_ResolvedByQueryKey(t *testing.T) {
 	var want TableQueryResponse
 	assert.NilError(t, json.Unmarshal(fixture, &want))
 
-	// In this fixture query_key ("10.30.0.1") happens to equal the RR service_ip
-	// Address too, since a query_key is normally the sip that was queried. That
-	// doesn't matter here: any key present in the response's query-key list
-	// releases the same waiter.
-	resp, err := deliverResult(t, cache, "10.30.0.1", func() (TableQueryResponse, error) {
+	// query_key ("10.30.0.1") happens to equal the RR service_ip Address in
+	// this fixture too, but that's incidental - any key in the response's
+	// query-key list releases the same waiter.
+	resp, err := deliverResult(t, bus, cache, "10.30.0.1", func() (TableQueryResponse, error) {
 		return cache.TableQueryByIpRequestBlocking("10.30.0.1")
 	}, fixture)
 
@@ -131,8 +125,7 @@ func TestTableQuery_ResolvedByQueryKey(t *testing.T) {
 
 func TestTableQuery_ResolvedByJobName(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
+	bus := installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = time.Second
 
@@ -140,7 +133,7 @@ func TestTableQuery_ResolvedByJobName(t *testing.T) {
 	var want TableQueryResponse
 	assert.NilError(t, json.Unmarshal(fixture, &want))
 
-	resp, err := deliverResult(t, cache, "app.ns.svc.inst", func() (TableQueryResponse, error) {
+	resp, err := deliverResult(t, bus, cache, "app.ns.svc.inst", func() (TableQueryResponse, error) {
 		return cache.TableQueryByJobNameRequestBlocking("app.ns.svc.inst")
 	}, fixture)
 
@@ -150,8 +143,7 @@ func TestTableQuery_ResolvedByJobName(t *testing.T) {
 
 func TestTableQuery_ResolvedBySipAddress(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
+	bus := installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = time.Second
 
@@ -160,7 +152,7 @@ func TestTableQuery_ResolvedBySipAddress(t *testing.T) {
 	assert.NilError(t, json.Unmarshal(fixture, &want))
 
 	// "10.30.1.1" is the instance_ip service_ip Address, distinct from query_key/app_name.
-	resp, err := deliverResult(t, cache, "10.30.1.1", func() (TableQueryResponse, error) {
+	resp, err := deliverResult(t, bus, cache, "10.30.1.1", func() (TableQueryResponse, error) {
 		return cache.TableQueryByIpRequestBlocking("10.30.1.1")
 	}, fixture)
 
@@ -170,8 +162,7 @@ func TestTableQuery_ResolvedBySipAddress(t *testing.T) {
 
 func TestTableQuery_ResolvedBySipAddressV6(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
+	bus := installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = time.Second
 
@@ -180,7 +171,7 @@ func TestTableQuery_ResolvedBySipAddressV6(t *testing.T) {
 	assert.NilError(t, json.Unmarshal(fixture, &want))
 
 	// "fdff:1001::1" is the instance_ip service_ip Address_v6.
-	resp, err := deliverResult(t, cache, "fdff:1001::1", func() (TableQueryResponse, error) {
+	resp, err := deliverResult(t, bus, cache, "fdff:1001::1", func() (TableQueryResponse, error) {
 		return cache.TableQueryByIpRequestBlocking("fdff:1001::1")
 	}, fixture)
 
@@ -190,8 +181,7 @@ func TestTableQuery_ResolvedBySipAddressV6(t *testing.T) {
 
 func TestTableQuery_Timeout_ReturnsMqttTimeoutAndLeaksEntry(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
+	installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = 50 * time.Millisecond
 
@@ -213,8 +203,7 @@ func TestTableQuery_Timeout_ReturnsMqttTimeoutAndLeaksEntry(t *testing.T) {
 
 func TestTableQuery_Concurrent_SecondIsRejected(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
+	installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = 300 * time.Millisecond
 
@@ -239,8 +228,7 @@ func TestTableQuery_Concurrent_SecondIsRejected(t *testing.T) {
 
 func TestTableQuery_InterestRegistered_ReturnsErrorUnlessForced(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
+	installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = 50 * time.Millisecond
 
@@ -267,7 +255,7 @@ func TestTablequeryResultHandler_MalformedJSON_LogsAndNilsEmptyKey(t *testing.T)
 	// On malformed JSON, JobName and QueryKey stay at their zero value (""); the
 	// handler still runs its notify-and-clear loop for that key, leaving
 	// siprequests[""] = nil even though nothing was ever pending on it.
-	cache.TablequeryResultMqttHandler(nil, &fakeMessage{payload: []byte("not json")})
+	cache.handleTableQueryResult(messaging.Message{Payload: []byte("not json")})
 
 	cache.requestadd.RLock()
 	defer cache.requestadd.RUnlock()
@@ -282,8 +270,7 @@ func TestTablequeryResultHandler_MalformedJSON_LogsAndNilsEmptyKey(t *testing.T)
 
 func TestTablequeryResultHandler_CsmShapedHostPortString_FailsUnmarshal(t *testing.T) {
 	resetForTest(t)
-	installFakeClient(nil)
-	InitNetMqttClient("node1", "host", "1883", "", "")
+	bus := installBus(t)
 	cache := GetTableQueryRequestCacheInstance()
 	tableQueryTimeout = time.Second
 
@@ -300,7 +287,7 @@ func TestTablequeryResultHandler_CsmShapedHostPortString_FailsUnmarshal(t *testi
 	// Go's json.Unmarshal still fills in the fields it decoded before the type
 	// mismatch, so app_name/query_key (and even service_ip) land in the struct and
 	// the handler still dispatches by them.
-	resp, err := deliverResult(t, cache, "app.ns.svc.inst", func() (TableQueryResponse, error) {
+	resp, err := deliverResult(t, bus, cache, "app.ns.svc.inst", func() (TableQueryResponse, error) {
 		return cache.TableQueryByJobNameRequestBlocking("app.ns.svc.inst")
 	}, fixture)
 
@@ -318,7 +305,7 @@ func TestTablequeryResultHandler_NoWaiter_IsNoop(t *testing.T) {
 
 	// Nobody registered interest in any of these keys; the handler must not panic
 	// or block. It just marks each key as seen (nil).
-	cache.TablequeryResultMqttHandler(nil, &fakeMessage{payload: fixture})
+	cache.handleTableQueryResult(messaging.Message{Payload: fixture})
 
 	cache.requestadd.RLock()
 	defer cache.requestadd.RUnlock()
