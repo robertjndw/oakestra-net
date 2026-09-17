@@ -14,7 +14,7 @@ importlib-metadata~=8.7.0
 itsdangerous~=2.2.0
 Jinja2~=3.1.6
 MarkupSafe~=3.0.2
-oakestra_messaging @ git+https://github.com/oakestra/oakestra.git@feat/add-pub-sub-interface#subdirectory=libraries/oakestra_messaging
+oakestra_messaging @ git+https://github.com/robertjndw/oakestra.git@feat/add-pub-sub-interface#subdirectory=libraries/oakestra_messaging
 paho-mqtt==2.1.0
 pymongo==4.12.1
 python-engineio==4.12.1

@@ -17,10 +17,6 @@ require (
 	gotest.tools v2.2.0+incompatible
 )
 
-// Temporary: branch isn't pushed yet, so no pseudo-version to resolve. Drop
-// once it lands, then: go get .../oakestra_messaging_go@feat/add-pub-sub-interface
-replace github.com/oakestra/oakestra/libraries/oakestra_messaging_go => ../../oakestra.worktrees/feat-add-mqtt-tests/libraries/oakestra_messaging_go
-
 require (
 	github.com/ghodss/yaml v1.0.0 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
@@ -34,3 +30,7 @@ require (
 	golang.org/x/sys v0.36.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
+
+// Pinned to the fork until the library lands in oakestra/oakestra. Bump the
+// commit with: go mod edit -replace <module>=github.com/robertjndw/oakestra/libraries/oakestra_messaging_go@<sha> && go mod tidy
+replace github.com/oakestra/oakestra/libraries/oakestra_messaging_go => github.com/robertjndw/oakestra/libraries/oakestra_messaging_go v0.0.0-20260917085554-c75fe98289a5
